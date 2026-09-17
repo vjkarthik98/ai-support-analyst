@@ -5,6 +5,69 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-09-17
+
+The natural-language layer: questions in, grounded answers out. All five of the
+brief's sample questions now answer correctly against the live model.
+
+### Added
+
+- A bounded two-step pipeline. The model is forced to call one of two tools,
+  the result is computed locally, and a second call narrates the real figures.
+  Exactly two model calls per question, plus at most one repair attempt, giving
+  a predictable ceiling of roughly 1,500 tokens.
+- A `ChatClient` protocol separating orchestration from the Groq SDK. Only one
+  class imports Groq; the test suite injects a scripted fake and runs offline
+  with no API key and no cost.
+- A system prompt carrying the schema, enum values, null semantics, the time
+  anchor and worked date arithmetic — measured at roughly 670 tokens, with a
+  test that fails if it grows past its ceiling.
+- A one-shot repair retry. SQL rejected by the guard, or failing against the
+  database, is returned to the model with the specific error so it can correct
+  itself. A second failure is reported honestly rather than retried further.
+- Typed provider failures: rate limits carry the provider's `Retry-After`
+  value, and a missing API key raises at the point of use rather than at
+  import, so the deterministic endpoints keep working without credentials.
+- Result transparency. Every answer returns the generated SQL, the full row
+  set, row count, token usage and elapsed time alongside the prose.
+- 51 further tests covering the repair path, row capping, refusals, malformed
+  tool calls and provider failures — paths a live model would reach only
+  occasionally.
+
+### Fixed
+
+Found by running the pipeline against the live model; none were reachable
+through the mocked tests, since all three concern how a model reads text.
+
+- A query returning 34 correct rows was narrated as "No tickets matched". The
+  column held mostly NULLs, being unresolved tickets, and the model read that
+  as absent data. Results now state their row count explicitly and the prompt
+  defines NULL as "not applicable".
+- Averages were reported at full floating-point precision
+  (`3.7403846153846154`). Generated SQL now rounds them.
+- The model echoed the result metadata into its answer as prose ("1 rows
+  matched. The average is..."). That line is now bracketed so it reads as
+  machine annotation rather than a sentence.
+
+### Decided
+
+- Bounded the pipeline at two calls rather than using an open-ended agent loop.
+  On an 8,000 token-per-minute free tier, an unbounded loop lets one confused
+  question exhaust the budget for every subsequent one.
+- Set `reasoning_effort` to low. Measured at 12 reasoning tokens against 35 for
+  the default, with identical SQL — single-table aggregation is not a hard
+  reasoning problem.
+- Capped the rows shown to the model at 20, while still returning every row to
+  the caller. Sending 500 rows would cost roughly 15,000 tokens and exceed the
+  per-minute ceiling on a single question.
+- Omitted the 26 distinct issue summaries from the prompt. Including them would
+  add roughly 200 tokens to every call to spare the model an occasional `LIKE`.
+- Chose not to test whether the model writes good SQL. That is a property of
+  the model and the prompt, not of this code; asserting it would make the suite
+  slow, costly and dependent on network access. It is verified by hand against
+  the sample questions instead.
+
+
 ## [0.2.0] - 2026-09-17
 
 The deterministic core: data ingestion, query safety, and anomaly detection.
