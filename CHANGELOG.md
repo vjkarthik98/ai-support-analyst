@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-09-17
+
+The HTTP layer: four endpoints, a typed contract, and honest failure reporting.
+
+### Added
+
+- `GET /health` reporting readiness, the dataset row count, the time anchor,
+  the running version and whether natural-language querying is available.
+  Deliberately richer than a status flag, so the two most likely
+  misconfigurations — an empty dataset, or a missing key — are diagnosable
+  from a single request.
+- `POST /query` answering a natural-language question, returning the prose
+  answer together with the generated SQL, the complete result set, row count,
+  token usage and elapsed time. The evidence travels with the answer so a
+  figure can be verified rather than trusted.
+- `GET /anomalies` running the statistical detectors, with optional detector
+  selection and time window. No language model is involved, so it serves with
+  no API key configured.
+- `GET /schema` describing the table, its permitted values and the available
+  detectors, making the API self-describing.
+- Pydantic schemas at every boundary, generating the OpenAPI document served
+  at `/docs`. Field descriptions are written for whoever reads that page.
+- Interactive API documentation at `/docs`, exercising all four endpoints.
+- Failure mapped to meaningful status codes rather than a blanket 500:
+  429 with a `Retry-After` header for provider rate limits, 502 when the
+  provider is unreachable, 503 when no API key is configured, and 422 for a
+  malformed question or an unknown detector name. The distinction matters to a
+  caller: one should be retried after a wait, one may be retried immediately,
+  and one will never succeed until an operator intervenes.
+- CORS restricted to the configured UI origin rather than opened to all.
+- 30 further tests covering the contract, the failure paths and graceful
+  degradation, all running offline against a scripted model.
+
+### Fixed
+
+- Unknown detector names were reported with `KeyError`'s repr quoting, so the
+  message reached the caller wrapped in stray apostrophes.
+- `QueryRequest` declared `model_config` twice, the second silently discarding
+  the first and disabling whitespace stripping.
+
+### Decided
+
+- Built the database once at startup rather than per request, holding state on
+  the application instance rather than in module-level globals. The app can
+  therefore be constructed more than once, which is what lets the test suite
+  spin up isolated instances.
+- Kept a missing API key as a startup downgrade rather than a startup failure.
+  The service logs the downgrade, `/health` reports it, and the deterministic
+  endpoints continue to serve. A system that refuses to start because one
+  optional capability is unconfigured is harder to operate, not safer.
+- Returned the full result set from `/query` even when the model was shown only
+  a sample. Capping protects the token budget, but allowing it to truncate the
+  API response would leave a client believing twenty rows were the whole
+  answer — wrong, silently, with no error raised.
+- Wrote field descriptions for the reader of `/docs` rather than for the
+  codebase. That page is the API documentation during the walkthrough, so it is
+  a deliverable rather than a convenience.
+
+
 ## [0.3.0] - 2026-09-17
 
 The natural-language layer: questions in, grounded answers out. All five of the
