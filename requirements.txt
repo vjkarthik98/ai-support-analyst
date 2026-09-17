@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# AI Support Ticket Analyst - runtime and development dependencies
+#
+# Versions are pinned exactly (==) rather than left open (>=) so that the
+# evaluator's environment resolves to the same package set this system was
+# built and tested against. An unpinned install months from now could pull a
+# breaking major release and fail on a machine we cannot debug.
+# ---------------------------------------------------------------------------
+
+# --- API layer -------------------------------------------------------------
+fastapi==0.141.1           # REST framework; also generates the /docs OpenAPI UI
+uvicorn==0.53.0            # ASGI server that runs the FastAPI app
+
+# --- Configuration and validation -----------------------------------------
+pydantic==2.13.5           # Typed models validating every API boundary
+pydantic-settings==2.15.0  # Loads settings from environment / .env into a model
+python-dotenv==1.2.3       # Reads .env in run.py before subprocesses are spawned
+
+# --- LLM provider ----------------------------------------------------------
+groq==1.7.0                # Official Groq SDK (OpenAI-compatible tool calling)
+
+# --- Data layer ------------------------------------------------------------
+pandas==3.0.5              # CSV ingestion, dtype coercion, IQR anomaly maths
+                           # NOTE: sqlite3 is in the standard library - no dep.
+
+# --- User interface --------------------------------------------------------
+streamlit==1.64.0          # Minimal UI; a thin HTTP client of our own API
+
+# --- HTTP client -----------------------------------------------------------
+httpx==0.28.1              # Used by the Streamlit UI to call the API, and by
+                           # fastapi.testclient - one dependency, two jobs.
+
+# --- Testing ---------------------------------------------------------------
+pytest==9.1.1              # Unit and integration tests (no network required)

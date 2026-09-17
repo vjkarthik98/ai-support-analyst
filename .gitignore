@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Secrets - the single most important entry in this file.
+# .env holds the Groq API key. Committing it would publish a live credential
+# to a public repository. .env.example is committed instead: same keys, no
+# values, so the evaluator knows exactly what to supply.
+# ---------------------------------------------------------------------------
+.env
+*.key
+
+# ---------------------------------------------------------------------------
+# Virtual environment - thousands of platform-specific binaries. The evaluator
+# rebuilds this from requirements.txt; a committed venv would not even run on
+# their machine.
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Python bytecode and build artefacts -----------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Test and tooling caches -----------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Generated database. The SQLite file is rebuilt from the CSV on every startup,
+# so it is a build artefact, not source. The CSV in data/ IS committed, because
+# the evaluator needs it to run the system.
+# ---------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Editor and OS noise ---------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
