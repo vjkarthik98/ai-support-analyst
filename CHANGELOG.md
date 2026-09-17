@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-17
+
+Single-command startup. The system now runs with `python run.py`.
+
+### Added
+
+- A launcher that starts the API and the interface together, in the right
+  order, and stops both cleanly.
+- A pre-flight port check, run before anything is started, so a conflict is
+  reported as one sentence naming the port and the likely cause rather than a
+  traceback from inside a server's socket setup. Both ports are checked in the
+  same pass, so two conflicts can be fixed without restarting in between.
+- Health-gated startup. The interface is launched only once the API answers
+  `/health` with a 200. The API must parse the CSV and build its database
+  first, so starting both at once would show "cannot reach the API" as the
+  first thing anyone sees. The wait polls rather than sleeping a fixed
+  interval, so it is as fast as the machine allows, and watches the API process
+  so a crash is reported immediately instead of after the full timeout.
+- Shutdown that escalates from `terminate()` to `kill()` after a grace period,
+  running on every exit path including Ctrl+C, and stopping the interface
+  before the API it depends on.
+- A startup notice when no API key is configured, so running in deterministic
+  mode is an obvious state rather than a silent one.
+- 8 tests covering the port-availability logic.
+
+### Fixed
+
+- Progress output and error messages could appear out of order, because stdout
+  is block-buffered when it is not a terminal while stderr never is. An error
+  surfaced above the line printed before it, making the checks look as though
+  they had run in the wrong order.
+
+### Decided
+
+- Tested the port logic and deliberately not the process orchestration. Testing
+  the latter means mocking `subprocess.Popen`, at which point the test asserts
+  that the mock behaves like the mock — a test that `start_api` builds a
+  particular argument list is the source code written twice, and passes whether
+  or not the server starts. The orchestration was verified by running it
+  instead: happy path, port conflict, clean shutdown with no orphaned
+  processes, and startup with no API key. For a launcher, whose failure modes
+  are environmental rather than logical, that evidence is stronger than a mock
+  can provide.
+- Set `SO_REUSEADDR` on the port probe. Without it a port left in `TIME_WAIT`
+  by a run seconds earlier reads as occupied, and the launcher refuses to start
+  over a conflict that does not exist — while restarting immediately after
+  stopping is the most common thing anyone does.
+- Stopped child processes with `terminate()` rather than signals. On Windows
+  `CTRL_C_EVENT` propagates to the whole process group and is awkward to
+  target; calling `terminate()` on each child is simpler and behaves
+  identically on every platform.
+- Passed Streamlit's server options on the command line as well as setting them
+  in `.streamlit/config.toml`. The config file is their documented home, but a
+  user with a conflicting global Streamlit config would otherwise override it
+  and hit the first-run email prompt, which blocks startup entirely.
+
+
 ## [0.5.0] - 2026-09-17
 
 The user interface: a Streamlit dashboard that is a thin client of the API.
