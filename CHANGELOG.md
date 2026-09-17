@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-09-17
+
+The user interface: a Streamlit dashboard that is a thin client of the API.
+
+### Added
+
+- A question tab with the brief's six sample questions as one-click buttons, so
+  the system can be exercised without typing anything.
+- Every answer displayed with its evidence: rows returned, tool used, elapsed
+  time, token cost, the generated SQL in an expander, and the complete result
+  set as a table.
+- An anomalies dashboard with detector and time-window filters, showing each
+  report's method, threshold and tickets considered alongside the findings.
+- Severity charts drawn with Altair: horizontal bars sorted by measured value,
+  with the threshold marked as a dashed reference line, so how far past the
+  limit a ticket sits is legible at a glance.
+- A sidebar reporting service status, tickets loaded, the model in use and the
+  reference date, with an explanation of why that date is not today.
+- Failure states written for a person. An unreachable API says "start it with
+  `python run.py`", not `ConnectionRefusedError`.
+
+### Fixed
+
+Both found by exercising the interface rather than by reading the code.
+
+- Ranking queries rounded the aggregate before ordering by it. AGT-08 (3.4800)
+  and AGT-11 (3.4828) both round to 3.48, so the two tied and SQLite chose
+  between them arbitrarily — returning the correct agent by luck rather than
+  by logic. Ranking now orders by the unrounded value and displays the rounded
+  one.
+- Answers that listed individual tickets gave a partial list with no indication
+  it was partial, so 13 of 34 matching tickets read as though 34 did not exist.
+  A truncated list now states the total first.
+- Sample question buttons were laid out in three columns, so a longer question
+  wrapped to two lines and knocked the grid out of alignment. Now two columns,
+  ordered by length, with every label on one line.
+- Charts used Streamlit's native bar chart, which sorts a categorical axis
+  alphabetically — the table led with the worst offender while the chart led
+  with whichever ticket id sorted first.
+- Replaced `use_container_width`, deprecated and slated for removal, so the
+  app runs without deprecation warnings.
+
+### Decided
+
+- Kept the UI a pure HTTP client with no business logic. It never opens the
+  database, builds a prompt or computes an anomaly. Importing the service layer
+  directly would be marginally faster and would create a second code path that
+  only the UI exercises — which is how a UI and an API drift apart. The brief
+  requires both interfaces; this way they cannot disagree.
+- Declared `altair` in requirements despite it shipping with Streamlit. It is
+  imported directly, and relying on a transitive dependency means a future
+  Streamlit release could remove it and break the app with no visible cause.
+- Surfaced the reference date in the sidebar rather than hiding it in
+  configuration. It is the decision that makes relative-time questions work at
+  all, and an operator seeing empty results should be able to check it
+  immediately.
+- Showed the generated SQL beside every answer. An answer a reviewer can verify
+  is worth more than one they must trust, and it is the clearest demonstration
+  that figures come from the database rather than from the model.
+
+
 ## [0.4.0] - 2026-09-17
 
 The HTTP layer: four endpoints, a typed contract, and honest failure reporting.

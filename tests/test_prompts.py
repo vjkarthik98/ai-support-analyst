@@ -428,7 +428,11 @@ def test_narration_prompt_is_small() -> None:
     """
     system = build_narration_messages("q", evidence="data", as_of=AS_OF)[0]["content"]
 
-    assert estimate_tokens(system) < 200
+    # Raised from 200 once, deliberately, to carry two rules that each fixed a
+    # real misreading by the live model: that a column of NULLs is still a
+    # result, and that a partial list must state its total. Roughly a third of
+    # the selection prompt, which is the proportion that matters.
+    assert estimate_tokens(system) < 275
     # Column definitions and tool instructions must not reappear. The word
     # "tickets" itself is expected - it is the subject matter, not the schema.
     assert "resolution_time_hrs" not in system

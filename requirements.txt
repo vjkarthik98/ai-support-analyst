@@ -25,6 +25,9 @@ pandas==3.0.5              # CSV ingestion, dtype coercion, IQR anomaly maths
 
 # --- User interface --------------------------------------------------------
 streamlit==1.64.0          # Minimal UI; a thin HTTP client of our own API
+altair==6.3.0              # Severity charts sorted by value. Ships with
+                           # Streamlit, but imported directly - so declared
+                           # rather than relied on as a transitive dependency.
 
 # --- HTTP client -----------------------------------------------------------
 httpx==0.28.1              # Used by the Streamlit UI to call the API, and by

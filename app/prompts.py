@@ -106,6 +106,12 @@ RULES
 - Always label computed columns with AS, so results are readable.
 - Wrap averages in ROUND(x, 2). A raw AVG returns a long float that is
   unreadable in an answer.
+- Round only what is displayed. When ranking, ORDER BY the unrounded
+  aggregate, because rounding first can make two different values tie and
+  return the wrong row:
+    SELECT agent_id, ROUND(AVG(customer_rating), 2) AS avg_rating
+    FROM tickets GROUP BY agent_id
+    ORDER BY AVG(customer_rating) ASC LIMIT 1
 - For "which agent/category is highest or lowest", return the identifier
   together with the value, and ORDER BY with a LIMIT.
 - Use {ANOMALY_TOOL} only for questions about anomalies, outliers, unusual
@@ -252,8 +258,10 @@ def build_narration_messages(
         "- NULL means not applicable, usually an unresolved ticket. A column "
         "of NULLs is a real result, not missing data.\n"
         "- Answer the question directly. Do not mention rows, queries or the "
-        "data format unless results were truncated, in which case say how "
-        "many of the total are shown.\n"
+        "data format.\n"
+        "- Exception: if you list individual items and more matched than you "
+        "list, you must give the total first, as in '34 tickets matched; the "
+        "first 20 are ...'. Listing a partial set silently is misleading.\n"
         "- One or two sentences. No preamble, lists or markdown."
     )
 

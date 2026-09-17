@@ -1,0 +1,15 @@
+[server]
+# Suppresses Streamlit's first-run "enter your email" prompt. Without this the
+# evaluator gets an interactive prompt instead of the app -- a classic demo killer.
+headless = true
+
+# Bind to loopback only. The default binds every interface, which puts the app
+# on the local network. This is a local tool; it has no reason to be reachable
+# from another machine.
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
