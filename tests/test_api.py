@@ -142,6 +142,23 @@ def client() -> Iterator[TestClient]:
 
 
 @pytest.fixture
+def unguarded_client() -> Iterator[TestClient]:
+    """Yield a client that returns 500 responses instead of re-raising.
+
+    ``TestClient`` re-raises unhandled server exceptions by default, which is
+    usually helpful - a test failure shows the real traceback. But it makes the
+    catch-all handler untestable, because the exception never reaches it.
+    Disabling that is the only way to assert on what a real HTTP client would
+    actually receive.
+
+    Yields:
+        A test client that surfaces server errors as responses.
+    """
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        yield test_client
+
+
+@pytest.fixture
 def llm_client() -> Iterator[TestClient]:
     """Yield a client whose query service uses a scripted fake model.
 
@@ -475,7 +492,13 @@ def test_query_declines_ungrounded_answers(llm_client: TestClient) -> None:
     Args:
         llm_client: Test client with a running application.
     """
-    with_model(llm_client, prose("I think there are around 400."))
+    # Two prose replies: the first triggers the ladder retry, the second
+    # exhausts it. Only then is the question declined.
+    with_model(
+        llm_client,
+        prose("I think there are around 400."),
+        prose("Still around 400."),
+    )
 
     payload = llm_client.post("/query", json={"question": "How many?"}).json()
 
@@ -589,6 +612,100 @@ def test_provider_outage_returns_502(llm_client: TestClient) -> None:
 
     assert response.status_code == 502
     assert response.json()["error"] == "llm_unavailable"
+
+
+def test_unexpected_errors_keep_the_standard_shape(
+    unguarded_client: TestClient,
+) -> None:
+    """An unforeseen exception returns structured JSON, not a bare string.
+
+    Without a catch-all handler this path falls through to the framework's
+    default and returns the plain text "Internal Server Error", so a client
+    would parse one shape normally and a different one on the least predictable
+    path - precisely when clear diagnostics matter most.
+
+    Args:
+        unguarded_client: Test client with a running application.
+    """
+
+    class Unpredictable:
+        model = "fake-model"
+
+        def complete(self, *args: Any, **kwargs: Any) -> ChatResponse:
+            raise RuntimeError("an error nobody anticipated")
+
+    database = unguarded_client.app.state.database
+    unguarded_client.app.state.query_service = TicketQueryService(
+        client=Unpredictable(),
+        db_path=database.path,
+        as_of=database.as_of,
+        row_count=database.row_count,
+    )
+
+    response = unguarded_client.post("/query", json={"question": "How many tickets?"})
+
+    assert response.status_code == 500
+    assert set(response.json()) == {"error", "detail", "retry_after"}
+    assert response.json()["error"] == "internal_error"
+
+
+def test_internal_errors_do_not_leak_details(unguarded_client: TestClient) -> None:
+    """A 500 response reveals nothing about the internals that failed.
+
+    The exception is logged in full for the operator; the caller gets a generic
+    message. Internal paths, SQL fragments and library internals have no place
+    in an HTTP response.
+
+    Args:
+        unguarded_client: Test client with a running application.
+    """
+
+    class Leaky:
+        model = "fake-model"
+
+        def complete(self, *args: Any, **kwargs: Any) -> ChatResponse:
+            raise RuntimeError("secret internal detail at /srv/private/path")
+
+    database = unguarded_client.app.state.database
+    unguarded_client.app.state.query_service = TicketQueryService(
+        client=Leaky(),
+        db_path=database.path,
+        as_of=database.as_of,
+        row_count=database.row_count,
+    )
+
+    response = unguarded_client.post("/query", json={"question": "How many tickets?"})
+
+    assert "secret internal detail" not in response.text
+    assert "/srv/private/path" not in response.text
+
+
+def test_database_failure_returns_503_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database that cannot be read is an availability problem.
+
+    503 tells a caller to retry; 500 tells them to report a bug that does not
+    exist. The distinction is the difference between a transient condition and
+    a defect, and a client can act on only one of them.
+
+    Args:
+        client: Test client with no language model configured.
+        monkeypatch: pytest's attribute patcher.
+    """
+    import sqlite3
+
+    import app.main as main_module
+
+    def broken_load(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(main_module, "load_frame", broken_load)
+
+    response = client.get("/anomalies")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "data_unavailable"
 
 
 def test_errors_share_one_shape(client: TestClient) -> None:

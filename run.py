@@ -40,7 +40,26 @@ from pathlib import Path
 import httpx
 
 from app import __version__
-from app.config import settings
+
+# Importing settings validates .env. A typo there - a port that is not a
+# number, an unrecognised key - otherwise surfaces as a fourteen-line pydantic
+# traceback whose useful line is buried in the middle. This is the first thing
+# anyone runs, so the first failure they can hit deserves a readable message.
+try:
+    from app.config import settings
+except Exception as _config_error:  # noqa: BLE001 - reported, then re-raised
+    print("\n  Configuration error in your .env file:\n", file=sys.stderr)
+    for _line in str(_config_error).splitlines():
+        stripped = _line.strip()
+        # pydantic emits "field", then "  Input should be ...", then a docs
+        # URL. The first two are useful; the URL is noise here.
+        if stripped and not stripped.startswith("For further information"):
+            print(f"    {stripped}", file=sys.stderr)
+    print(
+        "\n  Compare your .env against .env.example, then try again.\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from None
 
 # stdout is block-buffered when it is not a terminal, while stderr never is.
 # Left alone, an error can surface above the progress line that was printed

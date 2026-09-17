@@ -99,6 +99,12 @@ def call_api(
             "The API did not respond in time. The model may be slow or "
             "rate limited - wait a moment and try again."
         )
+    except httpx.HTTPError as exc:
+        # Catches the remaining transport failures - a dropped connection, a
+        # malformed response, a protocol error. Rare, but an uncaught one would
+        # surface in the browser as a Python traceback, which tells a user
+        # nothing they can act on.
+        return None, f"Could not complete the request: {exc}"
 
     if response.status_code >= 400:
         try:
@@ -123,11 +129,13 @@ def render_sidebar() -> dict[str, Any] | None:
     st.sidebar.title("Service status")
 
     health, error = call_api("GET", "/health")
-    if error:
-        st.sidebar.error(error)
+    # Explicit rather than `assert health is not None`. Asserts are stripped
+    # under `python -O`, after which None would flow onward and fail later with
+    # an unrelated AttributeError, far from the request that actually failed.
+    if health is None:
+        st.sidebar.error("The API returned no health information.")
         return None
 
-    assert health is not None
     st.sidebar.success(f"API online - v{health['version']}")
     st.sidebar.metric("Tickets loaded", f"{health['dataset_rows']:,}")
 
@@ -320,11 +328,10 @@ def render_ask_tab(health: dict[str, Any]) -> None:
     with st.spinner("Translating to SQL, querying, and composing an answer..."):
         payload, error = call_api("POST", "/query", json={"question": question})
 
-    if error:
-        st.error(error)
+    if payload is None:
+        st.error(error or "The API returned no answer.")
         return
 
-    assert payload is not None
     render_answer(payload)
 
 
@@ -366,11 +373,10 @@ def render_anomalies_tab() -> None:
         params["window_days"] = int(window_label.split()[1])
 
     payload, error = call_api("GET", "/anomalies", params=params)
-    if error:
-        st.error(error)
+    if payload is None:
+        st.error(error or "The API returned no anomaly data.")
         return
 
-    assert payload is not None
     st.metric("Total anomalies", payload["total_anomalies"])
     st.divider()
 

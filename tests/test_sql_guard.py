@@ -208,3 +208,88 @@ def test_error_message_reports_statement_count() -> None:
     """A stacked statement is reported as such, not as a generic failure."""
     with pytest.raises(SqlGuardError, match="[Oo]nly one statement"):
         validate_select("SELECT 1; DROP TABLE tickets")
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets WHERE created_at >= date('now', '-7 days')",
+            id="date now",
+        ),
+        pytest.param(
+            "SELECT * FROM tickets WHERE created_at >= datetime('now')",
+            id="datetime now",
+        ),
+        pytest.param("SELECT strftime('%Y', 'now')", id="now as second argument"),
+        pytest.param(
+            "SELECT julianday('now') - julianday(created_at) FROM tickets",
+            id="julianday now",
+        ),
+        pytest.param(
+            "SELECT * FROM tickets WHERE created_at >= CURRENT_DATE", id="CURRENT_DATE"
+        ),
+        pytest.param(
+            "SELECT * FROM tickets WHERE created_at > CURRENT_TIMESTAMP",
+            id="CURRENT_TIMESTAMP",
+        ),
+    ],
+)
+def test_wall_clock_queries_are_rejected(sql: str) -> None:
+    """A query anchored to the real clock is refused.
+
+    This is the most dangerous mistake the model can make here, because it does
+    not fail. The data ends on 2024-03-30, so a query against the present
+    matches nothing - and "no tickets this week" is a perfectly plausible
+    answer, indistinguishable from a true one unless you already know the data
+    is historical. Every other rule in this module prevents damage; this one
+    prevents a confident, silent falsehood.
+
+    Args:
+        sql: A statement resolving against the real clock.
+    """
+    with pytest.raises(SqlGuardError, match="today's date"):
+        validate_select(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets "
+            "WHERE created_at >= datetime('2024-03-30 18:06:00', '-7 days')",
+            id="anchored datetime",
+        ),
+        pytest.param(
+            "SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) "
+            "FROM tickets GROUP BY month",
+            id="strftime on a column",
+        ),
+        pytest.param(
+            "SELECT * FROM tickets WHERE issue_summary LIKE '%now%'",
+            id="the word now inside a string literal",
+        ),
+        pytest.param(
+            "SELECT julianday('2024-03-30 18:06:00') - julianday(created_at) "
+            "FROM tickets",
+            id="julianday on the anchor",
+        ),
+    ],
+)
+def test_anchored_and_literal_queries_are_allowed(sql: str) -> None:
+    """Legitimate date arithmetic and text searches are unaffected.
+
+    The counterpart to the rejections above. A guard that also blocked
+    ``LIKE '%now%'`` or date functions applied to a column would break ordinary
+    questions, so the pattern matches ``'now'`` only where SQLite would read it
+    as the current time.
+
+    Args:
+        sql: A statement that must be accepted.
+    """
+    assert validate_select(sql)

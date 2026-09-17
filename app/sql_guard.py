@@ -101,6 +101,29 @@ _LEADING_WORD_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s*([A-Za-z_]+)")
 
 _LIMIT_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bLIMIT\b", re.IGNORECASE)
 
+# Expressions that resolve to the real clock. Harmless in most systems, but
+# ruinous here: the dataset ends on 2024-03-30, so any query anchored to the
+# present matches nothing at all.
+#
+# This is the most dangerous class of mistake the model can make, because it
+# does not fail. "No tickets this week" is a perfectly plausible answer, and
+# indistinguishable from a true one unless you already know the data is
+# historical. Every other guard here prevents damage; this one prevents a
+# confident, silent lie.
+# Matched against the *original* statement, not the sanitised copy. The
+# sanitiser empties string literals, so by the time it has run, 'now' has
+# become '' and is invisible - one guard's protection blinding another.
+#
+# Matching 'now' only where SQLite would interpret it, as the argument to a
+# date function, keeps legitimate text searches such as LIKE '%now%' working.
+_WALL_CLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
+    # [^)]* rather than \s* because 'now' is not always the first argument:
+    # strftime('%Y', 'now') puts it second.
+    r"\b(?:date|time|datetime|julianday|strftime|unixepoch)\s*\([^)]*'now'"
+    r"|\bCURRENT_DATE\b|\bCURRENT_TIME\b|\bCURRENT_TIMESTAMP\b",
+    re.IGNORECASE,
+)
+
 
 class SqlGuardError(ValueError):
     """Raised when generated SQL is not a safe, single read-only statement.
@@ -277,6 +300,20 @@ def validate_select(sql: str, *, max_rows: int | None = None) -> str:
         raise SqlGuardError(
             f"The statement uses {forbidden_match.group(1).upper()}, which is not "
             "permitted. Only read-only SELECT queries can be executed."
+        )
+
+    # Deliberately checked against the raw SQL rather than `statement`: see
+    # the pattern's own note on why the sanitised copy cannot see this.
+    wall_clock_match = _WALL_CLOCK_PATTERN.search(sql)
+    if wall_clock_match:
+        # Rejected rather than silently allowed, and phrased so the repair
+        # retry can act on it: the message names the offending expression and
+        # states the substitution to make.
+        raise SqlGuardError(
+            f"The statement uses {wall_clock_match.group(0)}, which resolves to "
+            "today's date. This dataset is a fixed historical snapshot, so a "
+            "query anchored to the present matches nothing. Use the reference "
+            "timestamp given in the instructions instead."
         )
 
     # Return the ORIGINAL text, not the sanitised copy - the latter has had its

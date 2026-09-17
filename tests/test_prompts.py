@@ -428,11 +428,18 @@ def test_narration_prompt_is_small() -> None:
     """
     system = build_narration_messages("q", evidence="data", as_of=AS_OF)[0]["content"]
 
-    # Raised from 200 once, deliberately, to carry two rules that each fixed a
-    # real misreading by the live model: that a column of NULLs is still a
-    # result, and that a partial list must state its total. Roughly a third of
-    # the selection prompt, which is the proportion that matters.
-    assert estimate_tokens(system) < 275
+    # Raised from 200 in two deliberate steps. Every rule added was driven by
+    # an observed failure against the live model, never by speculation:
+    #   - a column of NULLs is a real result, not missing data
+    #   - a partial list must state its total
+    #   - a NULL resolution time *satisfies* "not resolved in time"
+    #   - counts stay whole; only long decimals are rounded
+    #
+    # The number that matters is the proportion: this stays around 40% of the
+    # selection prompt, and roughly a fifth of a question's total cost. If a
+    # future edit pushes past this, the right response is to ask which rule has
+    # stopped earning its place - not to raise the ceiling again by reflex.
+    assert estimate_tokens(system) < 340
     # Column definitions and tool instructions must not reappear. The word
     # "tickets" itself is expected - it is the subject matter, not the schema.
     assert "resolution_time_hrs" not in system

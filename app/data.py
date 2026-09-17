@@ -32,12 +32,13 @@ from __future__ import annotations
 import csv
 import logging
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from app.config import settings
 
@@ -49,6 +50,10 @@ TABLE_NAME: Final[str] = "tickets"
 # schema description (section 3.3). Exported so app.sql_guard, app.anomalies
 # and app.prompts share one definition instead of three copies that could
 # drift apart.
+# The satisfaction rating's valid bounds, per the brief's schema description.
+MIN_RATING: Final[int] = 1
+MAX_RATING: Final[int] = 5
+
 CATEGORIES: Final[frozenset[str]] = frozenset({"Billing", "Technical", "General"})
 PRIORITIES: Final[frozenset[str]] = frozenset({"Low", "Medium", "High", "Critical"})
 STATUSES: Final[frozenset[str]] = frozenset({"Open", "Resolved", "Escalated"})
@@ -147,6 +152,32 @@ def _parse_created_at(raw: str, *, ticket_id: str) -> datetime:
         ) from exc
 
 
+def _reject_negative(value: float, *, field: str, ticket_id: str) -> float:
+    """Confirm a duration is not negative.
+
+    Both time columns measure elapsed hours, so a negative value is not merely
+    unusual - it is impossible. Accepting one would silently distort every
+    statistic computed over the column, and would drag the interquartile fence
+    downwards so that genuinely slow tickets stopped being flagged.
+
+    Args:
+        value: The parsed duration.
+        field: Column name, for the error message.
+        ticket_id: The owning ticket's id, for the error message.
+
+    Returns:
+        ``value``, unchanged, when it is valid.
+
+    Raises:
+        DataIntegrityError: If ``value`` is negative.
+    """
+    if value < 0:
+        raise DataIntegrityError(
+            f"{ticket_id}: {field} is {value}, but a duration cannot be negative"
+        )
+    return value
+
+
 def _parse_required_float(raw: str, *, field: str, ticket_id: str) -> float:
     """Parse a field that must always be present (e.g. response_time_hrs).
 
@@ -159,17 +190,18 @@ def _parse_required_float(raw: str, *, field: str, ticket_id: str) -> float:
         The parsed float.
 
     Raises:
-        DataIntegrityError: If ``raw`` is blank or not a valid float.
+        DataIntegrityError: If ``raw`` is blank, not a valid float, or negative.
     """
     text = raw.strip()
     if not text:
         raise DataIntegrityError(f"{ticket_id}: {field} is required but blank")
     try:
-        return float(text)
+        value = float(text)
     except ValueError as exc:
         raise DataIntegrityError(
             f"{ticket_id}: {field} {raw!r} is not numeric"
         ) from exc
+    return _reject_negative(value, field=field, ticket_id=ticket_id)
 
 
 def _parse_optional_float(raw: str, *, field: str, ticket_id: str) -> float | None:
@@ -193,11 +225,12 @@ def _parse_optional_float(raw: str, *, field: str, ticket_id: str) -> float | No
     if not text:
         return None
     try:
-        return float(text)
+        value = float(text)
     except ValueError as exc:
         raise DataIntegrityError(
             f"{ticket_id}: {field} {raw!r} is not numeric"
         ) from exc
+    return _reject_negative(value, field=field, ticket_id=ticket_id)
 
 
 def _parse_optional_int(raw: str, *, field: str, ticket_id: str) -> int | None:
@@ -218,11 +251,22 @@ def _parse_optional_int(raw: str, *, field: str, ticket_id: str) -> int | None:
     if not text:
         return None
     try:
-        return int(text)
+        value = int(text)
     except ValueError as exc:
         raise DataIntegrityError(
             f"{ticket_id}: {field} {raw!r} is not a whole number"
         ) from exc
+
+    # The brief defines this column as an integer from 1 to 5. A value outside
+    # that range would pass through every aggregate unnoticed and quietly shift
+    # averages, which is worse than an outright parse failure because nothing
+    # would look wrong.
+    if not MIN_RATING <= value <= MAX_RATING:
+        raise DataIntegrityError(
+            f"{ticket_id}: {field} is {value}, outside the valid range "
+            f"{MIN_RATING}-{MAX_RATING}"
+        )
+    return value
 
 
 def _validate_enum(
@@ -327,8 +371,14 @@ def _load_rows(csv_path: Path) -> tuple[list[tuple], datetime]:
 
     rows: list[tuple] = []
     latest_created_at: datetime | None = None
+    seen_ids: set[str] = set()
 
-    with csv_path.open(newline="", encoding="utf-8") as handle:
+    # "utf-8-sig" strips a byte-order mark when one is present and behaves
+    # exactly like "utf-8" when it is not. Worth having because saving this CSV
+    # from Excel adds a BOM, which would otherwise attach itself to the first
+    # header name - and the failure would read as "missing required column:
+    # ticket_id", pointing at the wrong problem entirely.
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         _validate_header(reader.fieldnames, csv_path)
 
@@ -344,9 +394,20 @@ def _load_rows(csv_path: Path) -> tuple[list[tuple], datetime]:
             if latest_created_at is None or created_at > latest_created_at:
                 latest_created_at = created_at
 
+            # Caught here rather than left to the primary-key constraint, which
+            # would report "UNIQUE constraint failed: tickets.ticket_id" -
+            # accurate, but it names neither the offending id nor the line.
+            identifier = _require_text(raw_row, "ticket_id", ticket_id)
+            if identifier in seen_ids:
+                raise DataIntegrityError(
+                    f"{identifier} appears more than once (line {line_number}); "
+                    "ticket ids must be unique"
+                )
+            seen_ids.add(identifier)
+
             rows.append(
                 (
-                    _require_text(raw_row, "ticket_id", ticket_id),
+                    identifier,
                     created_at.strftime("%Y-%m-%d %H:%M:%S"),
                     _validate_enum(
                         _require_text(raw_row, "category", ticket_id),
@@ -456,7 +517,54 @@ def build_database(
     return Database(path=db_path, as_of=as_of, row_count=len(rows))
 
 
-def get_connection(db_path: Path) -> sqlite3.Connection:
+class QueryTimeoutError(Exception):
+    """Raised when a query exceeds its execution budget.
+
+    A distinct type because the correct response differs from other SQL
+    failures. A malformed query can be repaired and retried; a query that ran
+    too long will simply run too long again, so retrying wastes both time and
+    the token budget.
+    """
+
+
+def _install_timeout(connection: sqlite3.Connection, seconds: float) -> None:
+    """Abort any query on this connection that outlives its budget.
+
+    Necessary because :mod:`app.sql_guard` cannot defend against this. A
+    recursive CTE such as::
+
+        WITH RECURSIVE bomb(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM bomb)
+        SELECT COUNT(*) FROM bomb
+
+    is a genuine read-only SELECT - the guard is right to allow it - and it
+    never terminates. Without a limit here, one generated query blocks its
+    request thread permanently and the service stays dead until restarted.
+
+    SQLite invokes the progress handler every ``n`` virtual-machine
+    instructions; returning a non-zero value aborts the statement. The interval
+    is large enough that the check costs nothing measurable, and small enough
+    that the abort is prompt.
+
+    Args:
+        connection: The connection to guard.
+        seconds: Wall-clock budget for any single statement.
+    """
+    deadline = time.monotonic() + seconds
+
+    def _expired() -> int:
+        """Report whether the budget has been exhausted.
+
+        Returns:
+            1 to abort the running statement, 0 to let it continue.
+        """
+        return 1 if time.monotonic() > deadline else 0
+
+    connection.set_progress_handler(_expired, 10_000)
+
+
+def get_connection(
+    db_path: Path, *, timeout_seconds: float | None = None
+) -> sqlite3.Connection:
     """Open a read-only connection to an already-built database.
 
     Read-only is enforced at the operating-system/SQLite level via the
@@ -493,11 +601,61 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
+
+    budget = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else settings.query_timeout_seconds
+    )
+    _install_timeout(connection, budget)
+
     return connection
 
 
+def execute_select(
+    connection: sqlite3.Connection, sql: str, *, max_rows: int
+) -> list[dict[str, Any]]:
+    """Run a validated SELECT and return its rows.
+
+    Translating SQLite's abort signal happens here rather than in the calling
+    layer, because the progress handler that produces it is installed here too
+    - the knowledge that "interrupted" means "budget exhausted" belongs beside
+    the code that set the budget.
+
+    Args:
+        connection: A read-only connection from :func:`get_connection`.
+        sql: A statement already cleared by :func:`app.sql_guard.validate_select`.
+        max_rows: Hard cap on rows returned, applied at fetch time so it holds
+            even if the statement carries no LIMIT clause.
+
+    Returns:
+        Result rows as plain dictionaries, ready to serialise.
+
+    Raises:
+        QueryTimeoutError: If the statement exceeded its execution budget.
+        sqlite3.Error: For any other database failure - an unknown column, for
+            instance - which the caller may be able to repair.
+    """
+    try:
+        cursor = connection.execute(sql)
+        return [dict(row) for row in cursor.fetchmany(max_rows)]
+    except sqlite3.OperationalError as exc:
+        # SQLite reports an aborted statement as a generic OperationalError
+        # reading "interrupted", which is indistinguishable by type from a
+        # syntax error. The message is the only signal available.
+        if "interrupted" in str(exc).lower():
+            raise QueryTimeoutError(
+                "That query took too long and was stopped. It may describe an "
+                "unbounded result - a recursive query, or a join without a "
+                "condition. Try asking something more specific."
+            ) from exc
+        raise
+
+
 @contextmanager
-def read_only_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+def read_only_connection(
+    db_path: Path, *, timeout_seconds: float | None = None
+) -> Iterator[sqlite3.Connection]:
     """Yield a read-only connection and guarantee it is closed.
 
     The preferred way to query. :func:`get_connection` hands back a connection
@@ -517,7 +675,7 @@ def read_only_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
     Yields:
         A read-only :class:`sqlite3.Connection`.
     """
-    connection = get_connection(db_path)
+    connection = get_connection(db_path, timeout_seconds=timeout_seconds)
     try:
         yield connection
     finally:

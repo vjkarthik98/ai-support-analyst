@@ -41,6 +41,7 @@ succeed until an operator intervenes.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -52,8 +53,16 @@ from fastapi.responses import JSONResponse
 from app import __version__
 from app.anomalies import DETECTORS, detect_anomalies, load_frame
 from app.config import settings
-from app.data import CATEGORIES, PRIORITIES, STATUSES, TABLE_NAME, build_database
+from app.data import (
+    CATEGORIES,
+    PRIORITIES,
+    STATUSES,
+    TABLE_NAME,
+    DataIntegrityError,
+    build_database,
+)
 from app.llm import (
+    LlmError,
     LlmNotConfiguredError,
     LlmRateLimitedError,
     LlmUnavailableError,
@@ -69,8 +78,12 @@ from app.models import (
     SchemaResponse,
 )
 
+# Configured here because this module is the application entry point. The
+# modules under app/ deliberately do not call basicConfig - a library that
+# configures logging hijacks it from whatever imports it, which is why the
+# convention places this responsibility with the application.
 logging.basicConfig(
-    level=logging.INFO,
+    level=settings.log_level,
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -115,15 +128,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Yields:
         ``None`` once startup is complete.
     """
-    database = build_database()
+    try:
+        database = build_database()
+    except (DataIntegrityError, FileNotFoundError, RuntimeError) as exc:
+        # Refusing to start is correct - a service that can answer nothing
+        # should not accept traffic - but the operator needs to read *why*.
+        # Raised bare, this message ends up buried in roughly seventy lines of
+        # asyncio and uvicorn frames, so it is logged plainly first.
+        logger.error("Cannot start: the ticket data could not be loaded.")
+        logger.error("  %s", exc)
+        logger.error("  Check CSV_PATH in your .env, or the file's contents.")
+        raise
+
     app.state.database = database
     logger.info(
         "Loaded %d tickets, anchored at %s", database.row_count, database.as_of
     )
 
-    # The query service is optional. Without a key the deterministic endpoints
-    # must still serve, so a missing credential is logged as a downgrade rather
-    # than raised as a startup failure.
+    # The query service is optional. Without it the deterministic endpoints
+    # must still serve, so any failure to construct it is logged as a downgrade
+    # rather than raised as a startup failure. Catching the base LlmError
+    # rather than one subclass keeps that true for causes not yet imagined -
+    # a missing package, a malformed key, a future provider error.
     try:
         app.state.query_service = TicketQueryService(
             client=build_chat_client(),
@@ -132,7 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             row_count=database.row_count,
         )
         logger.info("Natural-language querying enabled (%s)", settings.groq_model)
-    except LlmNotConfiguredError as exc:
+    except LlmError as exc:
         app.state.query_service = None
         logger.warning("Natural-language querying disabled: %s", exc)
 
@@ -256,6 +282,36 @@ async def handle_unavailable(
     """
     logger.error("Provider unavailable: %s", exc)
     return _error("llm_unavailable", str(exc), status.HTTP_502_BAD_GATEWAY)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+    """Return 500 in the standard error shape for anything unforeseen.
+
+    Without this, an unhandled exception falls through to the framework's
+    default handler and returns the bare string "Internal Server Error". Every
+    other failure in this API returns a structured body, so a client would have
+    to parse one shape normally and a different one on the least predictable
+    path - exactly when clear diagnostics matter most.
+
+    The exception is logged in full, with its traceback, while the response
+    carries only a generic message: internal details such as file paths and
+    SQL fragments should not be returned to a caller.
+
+    Args:
+        request: The failed request.
+        exc: The unhandled exception.
+
+    Returns:
+        A 500 response matching :class:`app.models.ErrorResponse`.
+    """
+    logger.exception("Unhandled error serving %s %s", request.method, request.url.path)
+    return _error(
+        "internal_error",
+        "The service encountered an unexpected error. Check the server logs "
+        "for details.",
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
 
 
 @app.get(
@@ -386,6 +442,16 @@ async def anomalies(
             "unknown_detector",
             str(exc.args[0]) if exc.args else "Unknown anomaly detector.",
             status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+    except sqlite3.Error as exc:
+        # A database that has gone missing or become locked is an availability
+        # problem, not a defect. 503 tells the caller to retry; 500 would tell
+        # them to report a bug that does not exist.
+        logger.error("Anomaly detection could not read the database: %s", exc)
+        return _error(
+            "data_unavailable",
+            "The ticket data is temporarily unavailable. Please retry shortly.",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     payloads = [report.to_dict() for report in reports]

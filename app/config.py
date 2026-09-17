@@ -37,6 +37,9 @@ class Settings(BaseSettings):
             the deterministic anomaly and health endpoints still serve
             normally - see :attr:`llm_enabled`.
         groq_model: Model id to use for tool-calling and narration.
+        llm_max_retries: Attempts to retry a transient provider failure. Rate
+            limits are never retried regardless of this value.
+        llm_timeout_seconds: Wall-clock limit on a single provider call.
         csv_path: Path to the source ticket data, relative to the repo root.
         as_of: Optional fixed reference "now" for relative-time questions.
             Left as ``None`` to auto-anchor to the dataset's own latest
@@ -48,6 +51,8 @@ class Settings(BaseSettings):
         api_port: Port the FastAPI server binds to.
         ui_port: Port the Streamlit UI binds to.
         max_result_rows: Hard cap on rows a single SQL query may return.
+        query_timeout_seconds: Wall-clock limit on a single query's execution,
+            after which it is aborted.
     """
 
     model_config = SettingsConfigDict(
@@ -71,6 +76,16 @@ class Settings(BaseSettings):
     )
     groq_model: str = Field(default="openai/gpt-oss-120b")
 
+    # How many times a *transient* provider failure is retried - a dropped
+    # connection or a 5xx. Rate limits are deliberately never retried; see
+    # app.llm for why that distinction matters on a per-minute token budget.
+    llm_max_retries: int = Field(default=2, ge=0, le=5)
+
+    # Wall-clock ceiling on one provider call. The SDK's own default allows 60
+    # seconds for a read, which is longer than a user will wait and longer than
+    # the UI's own timeout, so a slow call would fail at the wrong layer.
+    llm_timeout_seconds: float = Field(default=30.0, gt=0)
+
     # --- Dataset ---------------------------------------------------------
     csv_path: Path = Field(default=Path("data/support_tickets.csv"))
     as_of: datetime | None = Field(default=None)
@@ -86,6 +101,18 @@ class Settings(BaseSettings):
 
     # --- Query safety ------------------------------------------------------
     max_result_rows: int = Field(default=500, gt=0)
+
+    # A generated query can be a perfectly valid read-only SELECT and still run
+    # forever - a recursive CTE is the obvious case. Validation cannot catch
+    # that, because the statement is legitimate; only an execution limit can.
+    # Five seconds is far longer than any honest query over 500 rows needs.
+    query_timeout_seconds: float = Field(default=5.0, gt=0)
+
+    # --- Diagnostics -------------------------------------------------------
+    # Configurable so someone running this for the first time can raise it to
+    # DEBUG and watch the generated SQL and detector decisions, without having
+    # to edit and re-run the code to find out what it did.
+    log_level: str = Field(default="INFO")
 
     @field_validator("groq_api_key", mode="before")
     @classmethod
@@ -155,6 +182,34 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalise_log_level(cls, value: str) -> str:
+        """Accept a log level in any case, rejecting anything unrecognised.
+
+        Validated here rather than passed straight to :mod:`logging`, which
+        silently ignores a name it does not recognise - so a typo like "DEUBG"
+        would leave the level at its default and quietly explain nothing, at
+        exactly the moment someone was trying to diagnose a problem.
+
+        Args:
+            value: The configured level name.
+
+        Returns:
+            The level name in upper case.
+
+        Raises:
+            ValueError: If the name is not a standard logging level.
+        """
+        level = value.strip().upper()
+        valid = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+        if level not in valid:
+            raise ValueError(
+                f"LOG_LEVEL {value!r} is not recognised. "
+                f"Use one of: {', '.join(sorted(valid))}"
+            )
+        return level
 
     @field_validator("csv_path")
     @classmethod

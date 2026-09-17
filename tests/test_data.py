@@ -18,6 +18,7 @@ about *that file*. Asserting them against synthetic data would prove nothing.
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,9 @@ from app.config import settings
 from app.data import (
     Database,
     DataIntegrityError,
+    QueryTimeoutError,
     build_database,
+    execute_select,
     get_connection,
     read_only_connection,
 )
@@ -494,6 +497,258 @@ def test_optional_fields_may_be_blank(
 
     assert row["resolution_time_hrs"] is None
     assert row["customer_rating"] is None
+
+
+# ---------------------------------------------------------------------------
+# Runaway queries
+# ---------------------------------------------------------------------------
+
+
+def test_runaway_query_is_aborted(real_database: Database) -> None:
+    """A query that would never finish is stopped rather than hanging.
+
+    A recursive CTE is a legitimate read-only SELECT, so :mod:`app.sql_guard`
+    allows it - correctly, since nothing about the text is unsafe. Only an
+    execution limit can defend against it, and without one this statement
+    blocks its thread permanently: verified still running after twelve seconds
+    before the timeout existed.
+
+    The symptom of a regression here is a frozen service rather than a failing
+    assertion, which is exactly why it is pinned.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    runaway = (
+        "WITH RECURSIVE bomb(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM bomb) "
+        "SELECT COUNT(*) FROM bomb"
+    )
+    started = time.monotonic()
+
+    with read_only_connection(real_database.path, timeout_seconds=0.5) as connection:
+        with pytest.raises(QueryTimeoutError):
+            execute_select(connection, runaway, max_rows=500)
+
+    # Generous upper bound: the assertion is "it stopped", not "it stopped at
+    # precisely one second", which would be flaky on a loaded machine.
+    assert time.monotonic() - started < 10
+
+
+def test_connection_still_works_after_a_timeout(real_database: Database) -> None:
+    """An aborted query does not poison the connection.
+
+    The service must keep answering afterwards; a timeout that left the
+    database unusable would convert one bad question into an outage.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    runaway = (
+        "WITH RECURSIVE bomb(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM bomb) "
+        "SELECT COUNT(*) FROM bomb"
+    )
+
+    with read_only_connection(real_database.path, timeout_seconds=0.5) as connection:
+        with pytest.raises(QueryTimeoutError):
+            execute_select(connection, runaway, max_rows=500)
+
+        rows = execute_select(
+            connection, "SELECT COUNT(*) AS n FROM tickets", max_rows=500
+        )
+
+    assert rows == [{"n": 500}]
+
+
+def test_ordinary_queries_are_unaffected(real_database: Database) -> None:
+    """A normal query completes well inside the budget.
+
+    Guards against a timeout set so aggressively that legitimate work fails.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    with read_only_connection(real_database.path) as connection:
+        rows = execute_select(
+            connection,
+            "SELECT agent_id, COUNT(*) AS n FROM tickets GROUP BY agent_id",
+            max_rows=500,
+        )
+
+    assert len(rows) == 12
+
+
+def test_fetch_cap_applies_without_a_limit_clause(real_database: Database) -> None:
+    """Row capping holds even when the statement carries no LIMIT.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    with read_only_connection(real_database.path) as connection:
+        rows = execute_select(connection, "SELECT ticket_id FROM tickets", max_rows=10)
+
+    assert len(rows) == 10
+
+
+# ---------------------------------------------------------------------------
+# Malformed input an evaluator could plausibly produce
+# ---------------------------------------------------------------------------
+
+
+def test_byte_order_mark_is_handled(
+    valid_row: Callable[..., str], csv_header: str, tmp_path: Path
+) -> None:
+    """A CSV saved with a byte-order mark loads normally.
+
+    The likeliest of all the malformed-input cases, because saving this file
+    from Excel produces one. The mark would otherwise attach to the first
+    header name, and the failure would report "missing required column:
+    ticket_id" - pointing at entirely the wrong problem.
+
+    Args:
+        valid_row: Factory producing a valid row.
+        csv_header: The standard header row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = tmp_path / "bom.csv"
+    csv_path.write_text(f"{csv_header}\n{valid_row()}", encoding="utf-8-sig")
+
+    database = build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+    assert database.row_count == 1
+
+
+def test_duplicate_ticket_ids_are_named(
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """A repeated ticket id is reported with the id and the line number.
+
+    Caught during parsing rather than left to the primary-key constraint, whose
+    message names neither.
+
+    Args:
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(
+        valid_row(ticket_id="TKT-001"),
+        valid_row(ticket_id="TKT-002"),
+        valid_row(ticket_id="TKT-001"),
+    )
+
+    with pytest.raises(DataIntegrityError, match="TKT-001.*more than once"):
+        build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+
+@pytest.mark.parametrize(
+    "rating",
+    [pytest.param("0", id="below range"), pytest.param("9", id="above range")],
+)
+def test_ratings_outside_one_to_five_are_rejected(
+    rating: str,
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """A satisfaction rating outside 1-5 is refused.
+
+    The brief defines this column as an integer from 1 to 5. An out-of-range
+    value would pass through every aggregate unnoticed and quietly shift
+    averages - worse than a parse failure, because nothing would look wrong.
+
+    Args:
+        rating: An invalid rating value.
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row(customer_rating=rating))
+
+    with pytest.raises(DataIntegrityError, match="outside the valid range"):
+        build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+
+@pytest.mark.parametrize(
+    "rating",
+    [pytest.param("1", id="lower bound"), pytest.param("5", id="upper bound")],
+)
+def test_ratings_at_the_boundaries_are_accepted(
+    rating: str,
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """The extremes of the valid range are not rejected.
+
+    The companion to the test above: an off-by-one in the bounds check would
+    silently discard every one-star and five-star rating, skewing exactly the
+    figures an analyst cares about most.
+
+    Args:
+        rating: A valid boundary rating.
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row(customer_rating=rating))
+
+    database = build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+    assert database.row_count == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"response_time_hrs": "-3.0"}, id="negative response time"),
+        pytest.param({"resolution_time_hrs": "-10.0"}, id="negative resolution time"),
+    ],
+)
+def test_negative_durations_are_rejected(
+    overrides: dict[str, str],
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """A negative elapsed time is refused.
+
+    Not merely unusual but impossible, and accepting one would drag the
+    interquartile fence downwards so that genuinely slow tickets stopped being
+    flagged as outliers.
+
+    Args:
+        overrides: The field to corrupt.
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row(**overrides))
+
+    with pytest.raises(DataIntegrityError, match="cannot be negative"):
+        build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+
+def test_zero_duration_is_accepted(
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """A zero elapsed time is valid, unlike a negative one.
+
+    Instant is possible; travelling backwards is not.
+
+    Args:
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row(response_time_hrs="0.0"))
+
+    assert build_database(
+        csv_path=csv_path, db_path=tmp_path / "tickets.db"
+    ).row_count == 1
 
 
 def test_rows_are_accessible_by_column_name(real_database: Database) -> None:

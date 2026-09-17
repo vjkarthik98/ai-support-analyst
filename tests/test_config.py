@@ -186,6 +186,8 @@ def test_unknown_env_keys_are_rejected(env_file: Callable[[str], Path]) -> None:
         pytest.param("MAX_RESULT_ROWS=0", id="zero row cap"),
         pytest.param("API_PORT=0", id="port below range"),
         pytest.param("API_PORT=70000", id="port above range"),
+        pytest.param("QUERY_TIMEOUT_SECONDS=0", id="zero query timeout"),
+        pytest.param("QUERY_TIMEOUT_SECONDS=-1", id="negative query timeout"),
     ],
 )
 def test_out_of_range_values_are_rejected(
@@ -205,6 +207,43 @@ def test_out_of_range_values_are_rejected(
         Settings(_env_file=str(env_file(f"{assignment}\n")))
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        pytest.param("DEBUG", "DEBUG", id="upper case"),
+        pytest.param("debug", "DEBUG", id="lower case is normalised"),
+        pytest.param("  warning  ", "WARNING", id="whitespace is trimmed"),
+    ],
+)
+def test_log_level_is_normalised(
+    configured: str, expected: str, env_file: Callable[[str], Path]
+) -> None:
+    """A valid level is accepted in any case.
+
+    Args:
+        configured: The value as written in .env.
+        expected: The normalised result.
+        env_file: Factory writing a temporary ``.env``.
+    """
+    settings = Settings(_env_file=str(env_file(f"LOG_LEVEL={configured}\n")))
+
+    assert settings.log_level == expected
+
+
+def test_misspelled_log_level_is_rejected(env_file: Callable[[str], Path]) -> None:
+    """An unrecognised level fails rather than being silently ignored.
+
+    ``logging`` accepts an unknown level name without complaint and leaves the
+    level unchanged, so a typo such as "DEUBG" would quietly explain nothing -
+    at precisely the moment someone raised the level to diagnose a problem.
+
+    Args:
+        env_file: Factory writing a temporary ``.env``.
+    """
+    with pytest.raises(ValidationError, match="not recognised"):
+        Settings(_env_file=str(env_file("LOG_LEVEL=DEUBG\n")))
+
+
 def test_defaults_match_the_documented_values(env_file: Callable[[str], Path]) -> None:
     """An empty configuration yields the values ``.env.example`` documents.
 
@@ -222,3 +261,5 @@ def test_defaults_match_the_documented_values(env_file: Callable[[str], Path]) -
     assert settings.api_port == 8000
     assert settings.ui_port == 8501
     assert settings.max_result_rows == 500
+    assert settings.query_timeout_seconds == 5.0
+    assert settings.log_level == "INFO"

@@ -5,6 +5,90 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-09-17
+
+Answer verification, retry policy, and a fifty-question benchmark.
+
+### Added
+
+- A benchmark of fifty questions with answers computed directly from the
+  dataset, plus a runner that asks each one through the live pipeline and
+  grades the replies. Every expected answer is generated rather than typed, and
+  cross-checked against SQL — a benchmark with hand-written expectations would
+  fail correct behaviour and pass incorrect behaviour with no way to tell which.
+- Grounding verification. Every figure in an answer must be traceable to the
+  result rows, the anomaly report, or the question itself; anything else was
+  produced rather than computed, so the narration is discarded for a
+  deterministic summary. This turns "the model never does arithmetic" from a
+  property of the design into one checked on every response.
+- Rejection of wall-clock SQL — `date('now')`, `CURRENT_DATE` and their
+  relatives. Against a snapshot ending in March 2024 these match nothing, and
+  "no tickets this week" is indistinguishable from a true answer, so this is
+  the one failure mode that lies rather than breaks.
+- Disclosure of truncated results: an answer listing a sample without saying so
+  now states the total first.
+- An explicit retry policy. Transport failures and 5xx are retried with jittered
+  exponential backoff; rate limits and 4xx never are.
+- A second rung on the tool-selection ladder: one explicit instruction when the
+  model replies in prose, before the question is declined.
+- Configurable `LOG_LEVEL`, `LLM_MAX_RETRIES` and `LLM_TIMEOUT_SECONDS`.
+
+### Fixed
+
+Found by running the benchmark; none was reachable through the unit tests,
+because each concerns how the model behaves rather than how the code executes.
+
+- A model refusal was reported as a provider error. Groq rejects the whole
+  request when `tool_choice="required"` and the model answers in prose, placing
+  its reply in a `failed_generation` field, so five questions returned HTTP 400
+  for behaviour that was entirely correct.
+- The first fix for that made matters worse: forcing a tool call onto a refused
+  question produced an empty query, after which the narration answered "Paris."
+  from the model's own knowledge. A refusal is a judgement and is now final —
+  overriding one is how an ungrounded answer gets manufactured.
+- Malformed tool calls were shown to the user as raw JSON. The model's intent
+  is unambiguous when it names a tool and supplies arguments, so the call is
+  now rebuilt and executed.
+- The SLA question answered 49 instead of 80: "high-priority" was read as
+  `priority = 'High'`, dropping Critical, and it went to SQL rather than the
+  detector that computes exactly this.
+- Ties were invisible — one of two agents on 37 tickets was reported as the
+  sole leader. Correcting that then introduced a false tie, because two ratings
+  rounding to 3.48 are not equal at 3.4800 and 3.4828. Equal whole numbers are
+  a genuine tie; equal rounded decimals may not be.
+- A question about the system's own anomaly threshold was refused, though the
+  detector reports that value in every result.
+- Counts were rendered with decimals: "111.00 tickets".
+- The benchmark's own grader inferred which questions were machine-gradable
+  from whether the expected answer contained a digit. That failed correct
+  answers such as "ratings run from 1 to 5". Gradability is now declared per
+  question: 41 automatic, 9 requiring judgement.
+
+### Decided
+
+- Disabled the SDK's own retry loop. It retries 429 unconditionally, which
+  suits a per-request quota but not a per-minute token budget where recovery
+  takes about a minute and the backoff lasts seconds — it cannot succeed, and
+  it spends two further requests against a 30-per-minute ceiling.
+- Used full jitter in the backoff. Without it, clients that fail together retry
+  together and recreate the load that caused the failure.
+- Made the grounding check permissive by design. It allows rounding, derived
+  percentages, figures drawn from the question, years and small integers in
+  prose, because a false positive replaces a good answer with a blunt one on
+  every response, while catching only the rare fabricated one.
+- Matched wall-clock expressions against the raw SQL rather than the sanitised
+  copy. The sanitiser empties string literals, so by the time it has run `'now'`
+  has become `''` — one guard's protection had blinded another.
+- Kept prompts inside their token ceilings by consolidating rules rather than
+  raising the limits. The narration prompt ended smaller than before while
+  carrying more instructions, the growth having been redundancy between three
+  overlapping rules.
+- Recorded that the free tier enforces three limits but publishes only two in
+  its response headers. Tokens-per-day is invisible until a 429 body reveals
+  it, and it is the binding constraint: a full benchmark run costs roughly 80,000
+  of the 200,000 daily allowance.
+
+
 ## [0.6.0] - 2026-09-17
 
 Single-command startup. The system now runs with `python run.py`.

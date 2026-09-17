@@ -99,31 +99,31 @@ MEANING OF THE DATA
   SQL aggregates skip NULLs, so AVG and COUNT on those columns already
   consider resolved tickets only. Do not filter them out a second time.
 - "Resolved within N hours" means resolution_time_hrs <= N.
+- "High priority" in an SLA or urgency question means priority IN ('High',
+  'Critical') - both are urgent. Only read it as priority = 'High' when the
+  question names the level explicitly, as in "how many High priority tickets".
 
 RULES
 - Emit exactly one SQL statement, and only SELECT. Never INSERT, UPDATE,
   DELETE, DROP or ALTER; such a request must be refused.
 - Always label computed columns with AS, so results are readable.
-- Wrap averages in ROUND(x, 2). A raw AVG returns a long float that is
-  unreadable in an answer.
-- Round only what is displayed. When ranking, ORDER BY the unrounded
-  aggregate, because rounding first can make two different values tie and
-  return the wrong row:
-    SELECT agent_id, ROUND(AVG(customer_rating), 2) AS avg_rating
-    FROM tickets GROUP BY agent_id
-    ORDER BY AVG(customer_rating) ASC LIMIT 1
-- For "which agent/category is highest or lowest", return the identifier
-  together with the value, and ORDER BY with a LIMIT.
-- Use {ANOMALY_TOOL} only for questions about anomalies, outliers, unusual
-  values or SLA breaches. Use {QUERY_TOOL} for every other question.
+- Wrap averages in ROUND(x, 2) for display, but ORDER BY the unrounded value:
+  rounding first can make two different values tie and return the wrong row.
+- For "highest" or "lowest", return the identifier with its value, and use
+  LIMIT 3 rather than LIMIT 1 so that a tie at the top is visible.
+- Use {ANOMALY_TOOL} for questions about anomalies, outliers, unusual values,
+  or tickets breaching an SLA - including "unresolved high-priority tickets
+  older than N hours", which is exactly what its sla_breach detector computes.
+  Use {QUERY_TOOL} for every other question.
 
 EXAMPLES
 Q: How many tickets are currently open?
    SELECT COUNT(*) AS open_tickets FROM {TABLE_NAME} WHERE status = 'Open'
 
 Q: Which agent has the lowest average customer rating?
-   SELECT agent_id, AVG(customer_rating) AS avg_rating FROM {TABLE_NAME}
-   GROUP BY agent_id ORDER BY avg_rating ASC LIMIT 1
+   SELECT agent_id, ROUND(AVG(customer_rating), 2) AS avg_rating
+   FROM {TABLE_NAME} GROUP BY agent_id
+   ORDER BY AVG(customer_rating) ASC LIMIT 3
 
 Q: Show critical tickets not resolved within 12 hours.
    SELECT ticket_id, status, resolution_time_hrs FROM {TABLE_NAME}
@@ -176,8 +176,12 @@ def build_tool_schemas() -> list[dict[str, Any]]:
                 "name": ANOMALY_TOOL,
                 "description": (
                     "Run statistical anomaly detection over the tickets. Use "
-                    "this only when asked about anomalies, outliers, unusual "
-                    "values, or SLA breaches - not for ordinary filtering."
+                    "this when asked about anomalies, outliers, unusual "
+                    "values, or SLA breaches - not for ordinary filtering. "
+                    "Its report also states the threshold used and how it was "
+                    "derived, so call this for questions about what counts as "
+                    "anomalous or which threshold applies, rather than "
+                    "declining them."
                 ),
                 "parameters": {
                     "type": "object",
@@ -252,16 +256,20 @@ def build_narration_messages(
         "that date.\n\n"
         "Rules:\n"
         "- Use only the figures given. Never estimate or invent.\n"
-        "- Quote numbers exactly, rounded to two decimals.\n"
-        "- The bracketed first line is metadata, not part of the answer. Never "
-        "repeat it. Say nothing matched only when it reads '0 rows'.\n"
-        "- NULL means not applicable, usually an unresolved ticket. A column "
+        "- Quote numbers exactly, rounding long decimals to two places but "
+        "leaving whole numbers whole: 111 tickets, not 111.00.\n"
+        "- The bracketed first line is metadata: never repeat it, always "
+        "believe it. Any number above 0 means tickets DID match, however the "
+        "column values look.\n"
+        "- NULL means not applicable - a ticket never resolved. That still "
+        "matches a question about tickets not resolved in time, and a column "
         "of NULLs is a real result, not missing data.\n"
-        "- Answer the question directly. Do not mention rows, queries or the "
-        "data format.\n"
-        "- Exception: if you list individual items and more matched than you "
-        "list, you must give the total first, as in '34 tickets matched; the "
-        "first 20 are ...'. Listing a partial set silently is misleading.\n"
+        "- Rows are in rank order. Equal whole numbers are a genuine tie, so "
+        "name them all; equal rounded decimals may differ beyond the digits "
+        "shown, so lead with the first and say the next is close behind.\n"
+        "- Answer directly, without mentioning rows or queries - except when "
+        "listing items and more matched than you list, where you must give the "
+        "total first: '34 tickets matched; the first 20 are ...'.\n"
         "- One or two sentences. No preamble, lists or markdown."
     )
 
