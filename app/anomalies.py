@@ -65,6 +65,10 @@ URGENT_PRIORITIES: Final[frozenset[str]] = frozenset({"High", "Critical"})
 # than inventing a threshold.
 MIN_SAMPLE_FOR_QUARTILES: Final[int] = 4
 
+# The conventional z-score cut-off, computed only to state what the rejected
+# alternative would have flagged - it never decides anything.
+Z_SCORE_CUTOFF: Final[float] = 3.0
+
 
 @dataclass(frozen=True)
 class Anomaly:
@@ -138,7 +142,9 @@ class AnomalyReport:
         as_of: The reference time used for any age calculation.
         considered: How many tickets were eligible for evaluation.
         anomalies: The flagged tickets.
-
+        rationale: Why this method suits the data, stated with figures
+            computed from it, or ``None`` for a detector with nothing to
+            justify - a business rule is agreed, not chosen.
     """
 
     kind: str
@@ -148,6 +154,7 @@ class AnomalyReport:
     as_of: datetime
     considered: int
     anomalies: list[Anomaly] = field(default_factory=list)
+    rationale: str | None = None
 
     @property
     def count(self) -> int:
@@ -169,6 +176,7 @@ class AnomalyReport:
             "considered": self.considered,
             "count": self.count,
             "anomalies": [anomaly.to_dict() for anomaly in self.anomalies],
+            "rationale": self.rationale,
         }
 
 
@@ -368,7 +376,46 @@ class ResolutionTimeOutlierDetector:
             as_of=as_of,
             considered=len(resolved),
             anomalies=anomalies,
+            rationale=_iqr_rationale(times, resolved, iqr_flagged=len(anomalies)),
         )
+
+
+def _iqr_rationale(
+    baseline_times: pd.Series, resolved: pd.DataFrame, *, iqr_flagged: int
+) -> str:
+    """Explain, with figures from the data, why the IQR fence is used.
+
+    Asked "why the IQR rather than a standard deviation?", the system could
+    only refuse: the justification lived in this module's docstring, which
+    the model never sees, and anything it said from general knowledge would be
+    ungrounded. Computing the evidence here lets the answer cite real figures.
+
+    Args:
+        baseline_times: Resolution times defining normal behaviour.
+        resolved: Resolved tickets being judged.
+        iqr_flagged: How many of them the IQR fence flagged.
+
+    Returns:
+        A sentence contrasting the skew and the two methods' flag counts.
+    """
+    mean = float(baseline_times.mean())
+    median = float(baseline_times.median())
+    deviation = float(baseline_times.std())
+
+    # A constant column has no spread, so every z-score is undefined; nothing
+    # can be flagged by it.
+    z_flagged = (
+        int(((resolved["resolution_time_hrs"] - mean) / deviation > Z_SCORE_CUTOFF).sum())
+        if deviation > 0 and not resolved.empty
+        else 0
+    )
+
+    return (
+        f"Resolution time is right-skewed: mean {mean:.2f}h against median "
+        f"{median:.2f}h. A z-score assumes a normal distribution this data "
+        f"lacks - z > {Z_SCORE_CUTOFF:g} flags only {z_flagged} tickets, while "
+        f"the IQR fence, which relies on no distribution, flags {iqr_flagged}."
+    )
 
 
 @dataclass(frozen=True)

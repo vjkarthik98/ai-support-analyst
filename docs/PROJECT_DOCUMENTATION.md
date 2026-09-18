@@ -6,7 +6,7 @@ A retrospective on how this project was built, for the record now that it is fin
 
 ## 1. The Assessment
 
-Built for the **AI Engineer internship assessment at DOTMappers IT Pvt. Ltd.** The brief was received 2026-09-16 at 6:30 PM with a **48-hour deadline**, due 2026-09-18 at 6:30 PM, submitted as a GitHub repository followed by a 30-minute architecture walkthrough call.
+Built for the **AI Engineer internship assessment at DOTMappers IT Pvt. Ltd.**, delivered as a GitHub repository.
 
 The task: take a 500-row customer support ticket CSV and build a system that answers natural-language questions about it and flags operational anomalies, exposed through both a REST API and a UI, using an LLM at zero cost, startable with a single command.
 
@@ -27,13 +27,13 @@ Three things in the brief and data did not match each other, and finding them be
 
 ## 3. Architecture Decided Up Front, and Held
 
-The core architecture was locked after this analysis and not revisited under deadline pressure:
+The core architecture was locked after this analysis and not revisited:
 
 > **The LLM is used for natural-language understanding and orchestration only. It never performs arithmetic.**
 
 Concretely: Groq free tier (`openai/gpt-oss-120b`) → a bounded, two-step native tool-calling pipeline → LLM-generated SQL validated as SELECT-only → executed against a read-only SQLite connection → the LLM narrates the real rows that come back. FastAPI serves four endpoints; Streamlit is a thin HTTP client of that API, never a second implementation. Anomaly detection is deterministic pandas with no model in its path at all. Everything starts with `python run.py`.
 
-Holding this decision for the full 48 hours — rather than reaching for an open-ended agent loop or letting the model estimate a figure directly — is what let every later fix be a *tightening* of the design instead of a rewrite of it. The full reasoning behind each piece is in the [README's Architecture](../README.md#architecture) and [Design Decisions](../README.md#design-decisions) sections.
+Holding this decision throughout the build — rather than reaching for an open-ended agent loop or letting the model estimate a figure directly — is what let every later fix be a *tightening* of the design instead of a rewrite of it. The full reasoning behind each piece is in the [README's Architecture](../README.md#architecture) and [Design Decisions](../README.md#design-decisions) sections.
 
 ---
 
@@ -53,16 +53,16 @@ Several defects were non-obvious enough that they are worth recording separately
 
 Two independent forms of evidence back the finished system, deliberately kept separate:
 
-1. **381 offline unit and integration tests**, running in under 10 seconds with no API key and no network access, using a `ChatClient` protocol so a scripted fake model exercises every code path — including ones a live model would reach only occasionally, such as the repair-retry loop and malformed tool calls.
+1. **397 offline unit and integration tests**, running in under 10 seconds with no API key and no network access, using a `ChatClient` protocol so a scripted fake model exercises every code path — including ones a live model would reach only occasionally, such as the repair-retry loop and malformed tool calls.
 2. **A 50-question live benchmark against the real model**, with expected answers generated from the data and cross-checked against SQL rather than typed by hand. This is what actually found the bugs that mattered: named months read incorrectly, month arithmetic that silently turned "last month" into "this month", numbers spelled out in words evading the grounding check, and a model refusal once rendered to the user as an unverified five-section essay. None of these were reachable through the mocked unit tests, because each concerns how the model behaves with real language, not how the code executes.
 
-The benchmark pass rate climbed from 95% to 98% to 100% (41 of 41 machine-gradable questions) across three same-day runs, each failure traced to a root cause and closed with a test reproducing it before the fix was written — never a prompt tweak accepted on faith. The full detail, including the one grounding fix made after the final run and independently re-verified live in the UI, is in the [README's Testing and Evaluation section](../README.md#testing-and-evaluation) and [docs/BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+The benchmark pass rate climbed from 95% to 98% to 100% (41 of 41 machine-gradable questions) across three runs, each failure traced to a root cause and closed with a test reproducing it before the fix was written — never a prompt tweak accepted on faith. The full detail, including the one grounding fix made after the final run and independently re-verified live in the UI, is in the [README's Testing and Evaluation section](../README.md#testing-and-evaluation) and [docs/BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
 
 ---
 
 ## 6. Outcome
 
-**Release 1.0.0**, submitted 2026-09-18, meets every requirement in the brief:
+**Release 1.0.1** meets every requirement in the brief:
 
 | Requirement | Delivered as |
 |---|---|
@@ -74,7 +74,7 @@ The benchmark pass rate climbed from 95% to 98% to 100% (41 of 41 machine-gradab
 
 The HTTP API, configuration surface, and startup command are held stable under Semantic Versioning from this release forward, so a future change to any of them is a 2.0.0 decision, not a silent one. What is *not* held stable — model-written answer wording, log messages, UI layout — is stated explicitly, so evaluators and future maintainers know exactly which surface is a contract and which is free to change.
 
-Nine version increments (0.1.0 → 1.0.0) took the project from scaffolding to a stable release inside the 48-hour window, each one documented in the [CHANGELOG](../CHANGELOG.md) with what changed, what broke, and why the fix was correct rather than merely different.
+Ten version increments (0.1.0 → 1.0.1) took the project from scaffolding to a stable release, the last fixing five answers found wrong in post-release testing, each one documented in the [CHANGELOG](../CHANGELOG.md) with what changed, what broke, and why the fix was correct rather than merely different.
 
 ---
 
@@ -84,4 +84,4 @@ Recorded honestly rather than left implicit — the full list, with reasoning, i
 
 ---
 
-**Author:** VIJAYA KARTHIK · Submitted for the DOTMappers IT Pvt. Ltd. AI Engineer Assessment
+**Author:** VIJAYA KARTHIK 

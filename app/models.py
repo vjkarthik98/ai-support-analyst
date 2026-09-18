@@ -147,6 +147,13 @@ class AnomalyReportModel(BaseModel):
     considered: int = Field(description="How many tickets were eligible.")
     count: int = Field(description="How many were flagged.")
     anomalies: list[AnomalyItem] = Field(description="The flagged tickets.")
+    rationale: str | None = Field(
+        default=None,
+        description=(
+            "Why this method suits the data, with figures computed from it. "
+            "Null for a fixed business rule."
+        ),
+    )
 
 
 class AnomalyResponse(BaseModel):

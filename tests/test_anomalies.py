@@ -808,3 +808,62 @@ def test_debug_log_shows_each_detector_decision(
     assert "resolution_time_outlier: flagged 21 of 327 considered (threshold 48.15" in caplog.text
     assert "sla_breach: flagged 80 of" in caplog.text
     assert "window all history" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The IQR rationale
+# ---------------------------------------------------------------------------
+
+
+def test_rationale_states_the_skew_and_both_flag_counts(real_database: Database) -> None:
+    """The report justifies the IQR with figures computed from the real data.
+
+    These are the benchmark's expected figures for "why the IQR rather than a
+    standard deviation?": mean 19.16 against median 12.00, and 7 tickets
+    flagged by z > 3 against 21 by the fence.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    (report,) = detect_anomalies(
+        load_frame(real_database.path),
+        as_of=real_database.as_of,
+        kinds=["resolution_time_outlier"],
+    )
+
+    assert report.rationale is not None
+    assert "mean 19.16h" in report.rationale
+    assert "median 12.00h" in report.rationale
+    assert "flags only 7 tickets" in report.rationale
+    assert f"flags {report.count}." in report.rationale
+    assert report.count == 21
+    assert report.to_dict()["rationale"] == report.rationale
+
+
+def test_rationale_survives_a_constant_column(
+    resolution_times: Callable[..., pd.DataFrame],
+) -> None:
+    """Identical resolution times have no spread, so no z-score is defined.
+
+    Args:
+        resolution_times: Factory building resolved tickets.
+    """
+    report = ResolutionTimeOutlierDetector().detect(
+        resolution_times(5.0, 5.0, 5.0, 5.0), as_of=AS_OF
+    )
+
+    assert report.rationale is not None
+    assert "flags only 0 tickets" in report.rationale
+
+
+def test_business_rule_carries_no_rationale(
+    make_frame: Callable[..., pd.DataFrame],
+) -> None:
+    """The SLA rule is agreed, not chosen from the data, so it justifies nothing.
+
+    Args:
+        make_frame: The general row factory.
+    """
+    report = SlaBreachDetector().detect(make_frame({"status": "Open"}), as_of=AS_OF)
+
+    assert report.rationale is None

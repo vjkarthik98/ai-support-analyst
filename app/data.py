@@ -631,6 +631,63 @@ def _install_timeout(connection: sqlite3.Connection, seconds: float) -> None:
     connection.set_progress_handler(_expired, 10_000)
 
 
+class _Correlation:
+    """SQLite aggregate computing the Pearson correlation of two columns.
+
+    SQLite has no ``CORR`` function. Without one, the model asked "is there a
+    relationship between response time and rating?" averaged each column
+    separately - an answer that cannot show a relationship at all. Registering
+    the statistic keeps the arithmetic in the database, where the design
+    requires it, rather than leaving the model to infer a trend from averages.
+
+    Rows where either value is NULL are skipped, matching how every built-in
+    SQL aggregate treats NULL.
+    """
+
+    def __init__(self) -> None:
+        """Initialise the running sums."""
+        self._n = 0
+        self._sum_x = 0.0
+        self._sum_y = 0.0
+        self._sum_xx = 0.0
+        self._sum_yy = 0.0
+        self._sum_xy = 0.0
+
+    def step(self, x: float | None, y: float | None) -> None:
+        """Accumulate one pair of values.
+
+        Args:
+            x: The first column's value.
+            y: The second column's value.
+        """
+        if x is None or y is None:
+            return
+        x, y = float(x), float(y)
+        self._n += 1
+        self._sum_x += x
+        self._sum_y += y
+        self._sum_xx += x * x
+        self._sum_yy += y * y
+        self._sum_xy += x * y
+
+    def finalize(self) -> float | None:
+        """Return the correlation coefficient.
+
+        Returns:
+            A value from -1 to 1, or ``None`` when fewer than two pairs exist
+            or either column is constant - a correlation is undefined then,
+            and NULL says so where 0 would claim "no relationship".
+        """
+        if self._n < 2:
+            return None
+        covariance = self._n * self._sum_xy - self._sum_x * self._sum_y
+        variance_x = self._n * self._sum_xx - self._sum_x**2
+        variance_y = self._n * self._sum_yy - self._sum_y**2
+        if variance_x <= 0 or variance_y <= 0:
+            return None
+        return covariance / math.sqrt(variance_x * variance_y)
+
+
 def get_connection(
     db_path: Path, *, timeout_seconds: float | None = None
 ) -> sqlite3.Connection:
@@ -670,6 +727,7 @@ def get_connection(
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
+    connection.create_aggregate("CORR", 2, _Correlation)
 
     budget = (
         timeout_seconds

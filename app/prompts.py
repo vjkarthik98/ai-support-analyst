@@ -114,14 +114,18 @@ MEANING OF THE DATA
 RULES
 - Emit exactly one SQL statement, and only SELECT. Never INSERT, UPDATE,
   DELETE, DROP or ALTER; such a request must be refused.
-- Always label computed columns with AS, so results are readable.
+- Always label computed columns with AS, so results are readable. Keep the
+  unit in a time alias: avg_resolution_hrs, never avg_resolution_time.
+- For a relationship between two numeric columns, return
+  ROUND(CORR(x, y), 3) AS correlation - never compare two averages.
 - Wrap averages in ROUND(x, 2) for display, but ORDER BY the unrounded value:
   rounding first can make two different values tie and return the wrong row.
 - For "highest" or "lowest", return the identifier with its value, and use
   LIMIT 3 rather than LIMIT 1 so that a tie at the top is visible.
 - Use {ANOMALY_TOOL} for questions about anomalies, outliers, unusual values,
   or tickets breaching an SLA - including "unresolved high-priority tickets
-  older than N hours", which is exactly what its sla_breach detector computes.
+  older than N hours", which is exactly what its sla_breach detector computes,
+  and why its method was chosen (IQR, z-score, standard deviation).
   Use {QUERY_TOOL} for every other question.
 
 EXAMPLES
@@ -188,8 +192,9 @@ def build_tool_schemas() -> list[dict[str, Any]]:
                     "values, or SLA breaches - not for ordinary filtering. "
                     "Its report also states the threshold used and how it was "
                     "derived, so call this for questions about what counts as "
-                    "anomalous or which threshold applies, rather than "
-                    "declining them."
+                    "anomalous, which threshold applies, or why the IQR is "
+                    "used over a standard deviation, rather than declining "
+                    "them."
                 ),
                 "parameters": {
                     "type": "object",
@@ -269,6 +274,10 @@ def build_narration_messages(
         "leaving whole numbers whole: 111, not 111.00.\n"
         "- State the figures, not trends or causes: small differences between "
         "groups are not a relationship.\n"
+        "- A correlation between -0.1 and 0.1 means no meaningful "
+        "relationship: say so.\n"
+        "- Durations are in hours, never days.\n"
+        "- Asked why, explain using the Rationale line.\n"
         "- The bracketed first line is metadata: never repeat it, always "
         "believe it. Any number above 0 means tickets DID match, however the "
         "column values look.\n"
@@ -357,6 +366,8 @@ def render_anomaly_reports(reports: list[dict[str, Any]]) -> str:
             f"Tickets considered: {report['considered']}\n"
             f"Anomalies found: {report['count']}"
         )
+        if report.get("rationale"):
+            header = f"{header}\nRationale: {report['rationale']}"
 
         anomalies = report["anomalies"][:NARRATION_ROW_LIMIT]
         if anomalies:

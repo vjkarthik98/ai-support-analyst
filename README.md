@@ -2,14 +2,14 @@
 
 **Ask questions about customer support tickets in plain English. Every answer is computed by SQL and statistics; the language model never does the arithmetic.**
 
-![Release](https://img.shields.io/badge/release-v1.0.0-4F46E5)
+![Release](https://img.shields.io/badge/release-v1.0.1-4F46E5)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688?logo=fastapi&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.64-FF4B4B?logo=streamlit&logoColor=white)
 ![Groq](https://img.shields.io/badge/LLM-Groq%20free%20tier-F55036)
-![Tests](https://img.shields.io/badge/tests-381%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-397%20passing-brightgreen)
 
-**Current release: v1.0.0** (stable) - 18 September 2026. The HTTP API, the configuration settings and the `python run.py` startup are held stable under [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](CHANGELOG.md) for what this release covers and how it got here.
+**Current release: v1.0.1** (stable) - 18 September 2026. The HTTP API, the configuration settings and the `python run.py` startup are held stable under [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](CHANGELOG.md) for what this release covers and how it got here.
 
 ---
 
@@ -244,7 +244,7 @@ The full history of decisions and the bugs that shaped them is in [CHANGELOG.md]
 | Analysis | `pandas` 3.0.5 | Vectorised statistics for anomaly detection |
 | Validation | `pydantic` 2.13.5 + `pydantic-settings` 2.15.0 | Typed settings and API schemas |
 | HTTP client | `httpx` 0.28.1 | UI → API calls, launcher health check |
-| Testing | `pytest` 9.1.1 | 381 offline tests |
+| Testing | `pytest` 9.1.1 | 397 offline tests |
 
 All versions are pinned in [requirements.txt](requirements.txt). Everything runs at **zero cost**.
 
@@ -506,7 +506,7 @@ Routed to the deterministic `detect_anomalies` tool, not SQL. The 48.15-hour thr
 pytest
 ```
 
-**381 tests** covering ingestion, the SQL guard, anomaly detectors, prompts, orchestration, grounding, logging, the API, the UI's text formatting and the launcher. They run **offline in under 10 seconds with no API key**: the query service depends on a `ChatClient` protocol, so tests inject a fake that returns scripted model responses.
+**397 tests** covering ingestion, the SQL guard, anomaly detectors, prompts, orchestration, grounding, logging, the API, the UI's text formatting and the launcher. They run **offline in under 10 seconds with no API key**: the query service depends on a `ChatClient` protocol, so tests inject a fake that returns scripted model responses.
 
 The fixes from the final code review were made test-first: each defect got a test reproducing it, confirmed to fail on the old code before the fix was written. Where a bug was found by the benchmark, the test uses the exact failing input, for example the SQL that turned "last month" into this month.
 
@@ -532,7 +532,7 @@ The run as it appeared in the terminal:
 
 **What the run covers.** Every change that affects answers was in place when it started, including the month-arithmetic fix for Q43, which had failed in the previous run and now passes, **with one exception**: the grounding fix described below was made *after* the run, prompted by its results. Its own code changes during the run added only DEBUG log lines.
 
-**How the 100% was reached, and what it hides.** The two earlier full runs today scored 95% and then 98%. Each failure was traced to a root cause and fixed with a test: named months (Q27), numbers written as words (Q29), and month arithmetic that turned "last month" into this month (Q43). **3 of the 50 answers (Q30, Q31, Q34) are deterministic summaries.** They pass because their figures are right, but they read less naturally than the model's answers, and they were caused by a bug. Earlier the same day, a loophole in the grounding check had been closed: it had accepted almost any number from 0 to 100 as a "percentage". That exposed a gap. The evidence header telling the model it saw "the first 20" rows was not counted as grounded, so the answer the prompt asks for (*"34 tickets matched; the first 20 are …"*) was rejected. The run's log confirms this for all three. The same warning, `Answer contained ungrounded figures ['20']`, appears once for each of Q30, Q31 and Q34 (each warning prints just before its question's progress line, in the terminal output below). Fixed after the run: any figure in the evidence the model read now counts as grounded. The invented figures the loophole used to let through are still caught. **All three questions were then asked again live in the UI, and each kept the model's own answer:**
+**How the 100% was reached, and what it hides.** The two earlier full runs scored 95% and then 98%. Each failure was traced to a root cause and fixed with a test: named months (Q27), numbers written as words (Q29), and month arithmetic that turned "last month" into this month (Q43). **3 of the 50 answers (Q30, Q31, Q34) are deterministic summaries.** They pass because their figures are right, but they read less naturally than the model's answers, and they were caused by a bug. Earlier the same day, a loophole in the grounding check had been closed: it had accepted almost any number from 0 to 100 as a "percentage". That exposed a gap. The evidence header telling the model it saw "the first 20" rows was not counted as grounded, so the answer the prompt asks for (*"34 tickets matched; the first 20 are …"*) was rejected. The run's log confirms this for all three. The same warning, `Answer contained ungrounded figures ['20']`, appears once for each of Q30, Q31 and Q34 (each warning prints just before its question's progress line, in the terminal output below). Fixed after the run: any figure in the evidence the model read now counts as grounded. The invented figures the loophole used to let through are still caught. **All three questions were then asked again live in the UI, and each kept the model's own answer:**
 
 | Q | Live answer after the fix |
 |---|---|
@@ -570,7 +570,7 @@ This section lists what the system **does not** do well or does not guarantee. N
 - **Strict verification can still cost readability.** Whenever the grounding check rejects an answer, the user gets a correct but plain summary such as *"34 rows matched. The full result is included below."* rather than a sentence. The figures are always correct; the wording is plainer.
 - **The benchmark is a snapshot, not a guarantee.** 100% is one run of 50 questions written by the author, and those questions were also used to find and fix bugs, so the system has in effect been tuned against them. Evaluator questions will differ, and 41 gradable questions is not a statistically strong sample.
 - **9 of the 50 benchmark questions are not auto-scored.** Refusals and explanations need human judgement, so they are marked "needs review" rather than counted as passes.
-- **Unit tests do not test the real model.** The 381 tests use a fake model client with scripted replies. They prove the code handles each response correctly; they cannot prove how the real model will respond.
+- **Unit tests do not test the real model.** The 397 tests use a fake model client with scripted replies. They prove the code handles each response correctly; they cannot prove how the real model will respond.
 - **The UI and the launcher's process handling are verified by running them.** Their logic is unit-tested (the UI's text formatting, the launcher's port checks and process watching); starting and stopping real processes, and page rendering, were checked by hand.
 
 ### Operational
@@ -635,7 +635,7 @@ ai-support-analyst/
 │   ├── check_groq.py      # Verify the Groq key and model
 │   ├── generate_benchmark.py
 │   └── run_benchmark.py
-├── tests/                 # 381 offline tests
+├── tests/                 # 397 offline tests
 ├── .streamlit/config.toml
 ├── .env.example           # Configuration template
 ├── requirements.txt
@@ -646,4 +646,4 @@ ai-support-analyst/
 
 ---
 
-**Author:** VIJAYA KARTHIK · Submitted for the DOTMappers IT Pvt. Ltd. AI Engineer Assessment
+**Author:** VIJAYA KARTHIK 

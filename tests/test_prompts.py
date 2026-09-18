@@ -45,8 +45,11 @@ AS_OF = datetime(2024, 3, 30, 18, 6)
 CHARS_PER_TOKEN = 4
 
 # Ceilings, not targets. Measured at ~667 and ~301 tokens; these leave room for
-# sensible edits while failing loudly if the prompt doubles.
-MAX_SYSTEM_PROMPT_TOKENS = 900
+# sensible edits while failing loudly if the prompt doubles. The system prompt
+# ceiling was raised from 900 for three rules, each fixing an observed wrong
+# answer: hour units kept in aliases, CORR for relationships, and routing
+# method questions to the detector.
+MAX_SYSTEM_PROMPT_TOKENS = 1000
 MAX_TOOL_SCHEMA_TOKENS = 450
 
 
@@ -532,12 +535,16 @@ def test_narration_prompt_is_small() -> None:
     #   - a partial list must state its total
     #   - a NULL resolution time *satisfies* "not resolved in time"
     #   - counts stay whole; only long decimals are rounded
+    # And raised from 340 in a third, for three more observed failures:
+    #   - 28.47 hours was narrated as "28.47 days"
+    #   - a -0.078 correlation needs reading as "no relationship"
+    #   - "why the IQR?" must be explained from the computed rationale
     #
     # The number that matters is the proportion: this stays around 40% of the
     # selection prompt, and roughly a fifth of a question's total cost. If a
     # future edit pushes past this, the right response is to ask which rule has
     # stopped earning its place - not to raise the ceiling again by reflex.
-    assert estimate_tokens(system) < 340
+    assert estimate_tokens(system) < 380
     # Column definitions and tool instructions must not reappear. The word
     # "tickets" itself is expected - it is the subject matter, not the schema.
     assert "resolution_time_hrs" not in system

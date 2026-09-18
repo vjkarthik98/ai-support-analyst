@@ -152,6 +152,100 @@ def _numbers_with_units(text: str) -> list[tuple[str, bool]]:
     ]
 
 
+def _written_forms(value: Any) -> set[str]:
+    """Return every way a numeric value might reasonably be written.
+
+    Forms are unsigned because :func:`extract_numbers` reads digits only: a
+    correlation of -0.078 appears in an answer as "0.078" or "-0.08", and both
+    are extracted as unsigned tokens. Recording the signed forms alone made a
+    correctly quoted negative figure look invented.
+
+    Args:
+        value: A cell or report value.
+
+    Returns:
+        Its written forms, or an empty set for anything that is not a number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return set()
+
+    magnitude = abs(value)
+    text = f"{magnitude}"
+    forms = {
+        text,
+        text.rstrip("0").rstrip(".") if "." in text else text,
+        f"{magnitude:.0f}",
+        f"{magnitude:.1f}",
+        f"{magnitude:.2f}",
+    }
+    # An answer may reasonably round 19.158 to 19.16 or to 19.2.
+    for places in (0, 1, 2):
+        forms.add(f"{round(float(magnitude), places)}")
+    return forms
+
+
+# Column names whose values are durations in hours - response_time_hrs, and
+# the aliases the model gives aggregates of it, such as avg_resolution_time.
+_HOUR_COLUMN_PATTERN: Final[re.Pattern[str]] = re.compile(r"hrs|hour|time", re.IGNORECASE)
+
+# A figure followed by "day" or "days".
+_DAYS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?P<figure>\d+(?:\.\d+)?)(?P<gap>\s*)days?\b", re.IGNORECASE
+)
+
+
+def correct_hour_units(
+    answer: str,
+    *,
+    rows: list[dict[str, Any]],
+    reports: list[dict[str, Any]] | None = None,
+) -> str:
+    """Restore "hours" where the model wrote an hour value as days.
+
+    Every duration in this dataset is measured in hours, but an aggregate
+    aliased ``avg_resolution_time`` no longer says so, and the model reported
+    "28.47 days" for a value of 28.47 hours - a figure the grounding check
+    passes, because the number is right and only its unit is wrong.
+
+    Only a figure that *is* an hour value in the evidence is corrected, so
+    "the last 7 days" in a date-range answer is left alone.
+
+    Args:
+        answer: The model's written answer.
+        rows: Result rows it was shown.
+        reports: Anomaly reports it was shown, whose values are all hours.
+
+    Returns:
+        The answer, with hour values labelled in hours.
+    """
+    hour_values: set[str] = set()
+    for row in rows:
+        for column, cell in row.items():
+            if _HOUR_COLUMN_PATTERN.search(column):
+                hour_values.update(_written_forms(cell))
+    for report in reports or []:
+        hour_values.update(_written_forms(report.get("threshold")))
+        for item in report.get("anomalies", []):
+            hour_values.update(_written_forms(item.get("value")))
+
+    def relabel(match: re.Match[str]) -> str:
+        """Rewrite one "N days" as "N hours" when N is an hour value.
+
+        Args:
+            match: A match of :data:`_DAYS_PATTERN`.
+
+        Returns:
+            The corrected text, or the original when N is not an hour value.
+        """
+        figure = match.group("figure")
+        if figure not in hour_values:
+            return match.group(0)
+        unit = "hour" if figure == "1" else "hours"
+        return f"{figure}{match.group('gap')}{unit}"
+
+    return _DAYS_PATTERN.sub(relabel, answer)
+
+
 def _grounded_values(
     rows: list[dict[str, Any]],
     reports: list[dict[str, Any]] | None,
@@ -179,20 +273,10 @@ def _grounded_values(
         Args:
             value: A figure from the evidence.
         """
-        if isinstance(value, bool) or value is None:
-            return
-        if isinstance(value, (int, float)):
-            text = f"{value}"
-            values.add(text)
-            values.add(text.rstrip("0").rstrip("."))
-            values.add(f"{value:.0f}")
-            values.add(f"{value:.1f}")
-            values.add(f"{value:.2f}")
-            # An answer may reasonably round 19.158 to 19.16 or to 19.2.
-            for places in (0, 1, 2):
-                values.add(f"{round(float(value), places)}")
-        elif isinstance(value, str):
+        if isinstance(value, str):
             values.update(extract_numbers(value))
+        else:
+            values.update(_written_forms(value))
 
     for row in rows:
         for cell in row.values():
@@ -207,6 +291,7 @@ def _grounded_values(
             record(item.get("reason"))
             record(item.get("ticket_id"))
         record(report.get("method"))
+        record(report.get("rationale"))
 
     values.update(extract_numbers(question))
 

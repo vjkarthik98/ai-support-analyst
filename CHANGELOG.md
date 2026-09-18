@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-09-18
+
+A bug-fix release. Five benchmark questions were answered wrongly or not at
+all in post-release testing of 1.0.0. Each was traced to its root cause and
+fixed with a regression test, and all five were re-verified live. No existing
+field, endpoint, setting or status code changes, so the 1.0.0 contract holds.
+
+### Fixed
+
+- **Durations reported in days instead of hours** (benchmark Q22, Q40, Q44).
+  An aggregate aliased `avg_resolution_time` lost the `_hrs` suffix, so the
+  model had no unit and guessed: 28.47 hours became "28.47 days". The grounding
+  check passed it, because the figure was right and only the unit was wrong.
+  Fixed three ways: the prompt now requires the unit in time aliases
+  (`avg_resolution_hrs`), the narration prompt states that durations are
+  hours, and a deterministic check relabels any "N days" in an answer as hours
+  when N is an hour value in the evidence. "The last 7 days" is left alone.
+- **"Why use the IQR rather than a standard deviation?" was refused** (Q33).
+  The justification lived in a code comment the model never sees, so it
+  declined the question as off-topic. The outlier detector now computes its own
+  rationale from the data - mean 19.16h against median 12.00h; z > 3 flags 7
+  tickets where the IQR fence flags 21 - and a declined question naming the
+  IQR, a z-score or a standard deviation is answered from that report. Other
+  declined questions still get the fixed refusal. The rationale is also
+  returned as an optional `rationale` field on each `/anomalies` report, null
+  for the SLA rule, so the API shows the same evidence the answer cites.
+- **A relationship question was answered with two averages** (Q42). SQLite
+  has no correlation function, so the model averaged each column separately,
+  which cannot show a relationship. A `CORR(x, y)` aggregate is now registered
+  on every connection and the prompt directs relationship questions to it;
+  response time against rating returns -0.078, matching pandas, and is read
+  as no meaningful relationship.
+- **Negative figures failed the grounding check when quoted.** Numbers are
+  extracted from answers without their sign, but evidence was recorded with
+  it, so "-0.08" for a correlation of -0.078 looked invented.
+
+### Tests
+
+- 16 regression tests, one or more per fix, bringing the suite to 397.
+
+
 ## [1.0.0] - 2026-09-18
 
 The first stable release. Every requirement in the assessment brief is met,

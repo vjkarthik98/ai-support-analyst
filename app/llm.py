@@ -59,10 +59,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Protocol, runtime_checkable
 
-from app.anomalies import UnknownDetectorError, detect_anomalies, load_frame
+from app.anomalies import (
+    ResolutionTimeOutlierDetector,
+    UnknownDetectorError,
+    detect_anomalies,
+    load_frame,
+)
 from app.config import settings
 from app.data import QueryTimeoutError, execute_select, read_only_connection
-from app.grounding import extract_numbers, ungrounded_numbers
+from app.grounding import correct_hour_units, extract_numbers, ungrounded_numbers
 from app.prompts import (
     ANOMALY_TOOL,
     NARRATION_ROW_LIMIT,
@@ -896,6 +901,25 @@ class TicketQueryService:
         )
         usage.add(selection)
 
+        if selection.declined and _asks_about_detection_method(question):
+            # "Why the IQR rather than a standard deviation?" is answerable -
+            # the outlier detector computes its own justification from the
+            # data - yet the model declines it as off-topic even when the tool
+            # description says otherwise. Running the detector here is not the
+            # override that once produced "Paris.": no model-chosen query is
+            # forced, the evidence is deterministic, and the narration still
+            # passes the grounding check.
+            logger.info("Declined method question routed to the detector: %s", question)
+            return self._answer_with_anomalies(
+                question,
+                ToolCall(
+                    name=ANOMALY_TOOL,
+                    arguments={"kind": ResolutionTimeOutlierDetector.kind},
+                ),
+                started=started,
+                usage=usage,
+            )
+
         if selection.declined:
             # The model judged that no tool applies - to "what is the capital
             # of France?", or "delete all tickets". That judgement is correct
@@ -1357,6 +1381,10 @@ class TicketQueryService:
             logger.info("Answer omitted %d total(s) for a sampled result", len(missing))
             text = f"{' '.join(missing)} {text}"
 
+        # A correct figure with the wrong unit passes every check above:
+        # 28.47 hours was reported as "28.47 days".
+        text = correct_hour_units(text, rows=rows or [], reports=reports)
+
         return text, narration
 
     def _execute(self, sql: str) -> list[dict[str, Any]]:
@@ -1417,6 +1445,26 @@ class TicketQueryService:
             completion_tokens=usage.completion_tokens,
             tokens_estimated=usage.estimated,
         )
+
+
+# Questions about how outliers are detected, as opposed to which tickets are
+# outliers. Matched only once the model has already declined the question.
+_DETECTION_METHOD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:iqr|interquartile|z-?\s?scores?|standard\s+deviations?|std\s*dev)\b",
+    re.IGNORECASE,
+)
+
+
+def _asks_about_detection_method(question: str) -> bool:
+    """Report whether a question asks how anomalies are detected.
+
+    Args:
+        question: The user's question.
+
+    Returns:
+        ``True`` when it names the outlier method or its alternatives.
+    """
+    return bool(_DETECTION_METHOD_PATTERN.search(question))
 
 
 # Phrasings that assert an empty result. Matched only when rows were actually
@@ -1559,7 +1607,9 @@ def _describe_reports(reports: list[dict[str, Any]]) -> str:
         f"flagged ({_describe_threshold(report['threshold'])})"
         for report in reports
     ]
-    return ". ".join(parts) + "."
+    summary = ". ".join(parts) + "."
+    rationales = [report["rationale"] for report in reports if report.get("rationale")]
+    return " ".join([summary, *rationales])
 
 
 def _describe_threshold(threshold: float | None) -> str:

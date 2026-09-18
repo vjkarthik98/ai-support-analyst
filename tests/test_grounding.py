@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.grounding import extract_numbers, ungrounded_numbers
+from app.grounding import correct_hour_units, extract_numbers, ungrounded_numbers
 
 
 def check(
@@ -232,3 +232,53 @@ def test_number_extraction(text: str, expected: list[str]) -> None:
         expected: Numbers that should be found.
     """
     assert extract_numbers(text) == expected
+
+
+# ---------------------------------------------------------------------------
+# Negative figures and hour units
+# ---------------------------------------------------------------------------
+
+
+def test_negative_figure_is_grounded_when_rounded() -> None:
+    """A -0.078 correlation may be quoted as "-0.08" without being invented."""
+    assert (
+        ungrounded_numbers(
+            "The correlation is -0.08, so there is no meaningful relationship.",
+            rows=[{"correlation": -0.078}],
+            reports=None,
+            question="Is there a relationship?",
+            row_count=1,
+        )
+        == []
+    )
+
+
+def test_hour_value_written_as_days_is_relabelled() -> None:
+    """28.47 hours narrated as days is corrected to hours."""
+    answer = correct_hour_units(
+        "Low takes longest at 28.47 days.",
+        rows=[{"priority": "Low", "avg_resolution_time": 28.47}],
+    )
+
+    assert answer == "Low takes longest at 28.47 hours."
+
+
+def test_days_that_are_not_hour_values_are_left_alone() -> None:
+    """A date range such as "the last 7 days" is not an hour value."""
+    answer = correct_hour_units(
+        "Over the last 7 days the average was 13.43 hours.",
+        rows=[{"avg_resolution_hrs": 13.43}],
+    )
+
+    assert answer == "Over the last 7 days the average was 13.43 hours."
+
+
+def test_hour_values_from_anomaly_reports_are_relabelled() -> None:
+    """Detector values are hours too."""
+    answer = correct_hour_units(
+        "TKT-108 took 119.7 days.",
+        rows=[],
+        reports=[{"threshold": 48.15, "anomalies": [{"value": 119.7}]}],
+    )
+
+    assert answer == "TKT-108 took 119.7 hours."

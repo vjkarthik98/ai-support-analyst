@@ -642,13 +642,98 @@ def test_declined_answer_uses_the_fixed_refusal(service_factory) -> None:
     Args:
         service_factory: Factory building a service with a scripted client.
     """
-    essay = "### 1. Robustness\nThe IQR ignores the 25% of values in each tail."
+    essay = "### 1. Averages\nThe mean is 25% more sensitive than the median."
     service, _ = service_factory(ChatResponse(text=essay, declined=True))
 
-    result = service.answer("Why use the IQR rather than a standard deviation?")
+    result = service.answer("Why is the mean a poor summary in general?")
 
     assert result.answer == REFUSAL_MESSAGE
     assert "25%" not in result.answer
+
+
+def test_declined_method_question_is_answered_from_the_detector(service_factory) -> None:
+    """A declined "why the IQR?" question is answered with computed figures.
+
+    The model declined this benchmark question as off-topic, so the user got
+    the refusal. The detector states its own rationale from the data, so the
+    question is routed there and narrated like any anomaly answer.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, client = service_factory(
+        ChatResponse(text="That is a general statistics question.", declined=True),
+        text_response(
+            "Resolution time is right-skewed (mean 19.16 hours, median 12.00), "
+            "so z > 3 flags only 7 tickets while the IQR fence flags 21."
+        ),
+    )
+
+    result = service.answer("Why use the interquartile range rather than a standard deviation?")
+
+    assert result.tool == ANOMALY_TOOL
+    assert result.answer != REFUSAL_MESSAGE
+    assert "19.16" in result.answer and "21" in result.answer
+    # The detector's rationale reached the narration as evidence.
+    narration_input = client.calls[1]["messages"][1]["content"]
+    assert "Rationale:" in narration_input
+    assert len(client.calls) == 2
+
+
+def test_hour_values_narrated_as_days_are_corrected(service_factory) -> None:
+    """An hour value written as days is relabelled in hours.
+
+    Observed in the benchmark: a column aliased ``avg_resolution_time`` lost
+    its unit, and 28.47 hours was reported as "28.47 days".
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(
+            QUERY_TOOL,
+            sql=(
+                "SELECT priority, ROUND(AVG(resolution_time_hrs), 2) AS "
+                "avg_resolution_time FROM tickets GROUP BY priority "
+                "ORDER BY AVG(resolution_time_hrs) DESC LIMIT 1"
+            ),
+        ),
+        text_response("Low priority takes longest, at 28.47 days on average."),
+    )
+
+    result = service.answer("Which priority level takes longest to resolve on average?")
+
+    assert "28.47 hours" in result.answer
+    assert "days" not in result.answer
+
+
+def test_correlation_is_computed_by_the_database(service_factory) -> None:
+    """CORR is available to generated SQL and returns the Pearson value.
+
+    Without it the model compared two averages, which cannot show a
+    relationship. The figure is checked against pandas' own computation.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(
+            QUERY_TOOL,
+            sql=(
+                "SELECT ROUND(CORR(response_time_hrs, customer_rating), 3) "
+                "AS correlation FROM tickets"
+            ),
+        ),
+        text_response(
+            "The correlation is -0.078, so there is no meaningful relationship."
+        ),
+    )
+
+    result = service.answer("Is there a relationship between response time and customer rating?")
+
+    assert result.rows == [{"correlation": -0.078}]
+    # A correctly quoted negative figure must not be mistaken for an invented one.
+    assert "no meaningful relationship" in result.answer
 
 
 def test_prose_reply_triggers_one_retry(service_factory) -> None:

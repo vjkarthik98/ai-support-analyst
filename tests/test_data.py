@@ -870,3 +870,57 @@ def test_rows_are_accessible_by_column_name(real_database: Database) -> None:
 
     assert row["ticket_id"].startswith("TKT-")
     assert row["status"] in {"Open", "Resolved", "Escalated"}
+
+
+# ---------------------------------------------------------------------------
+# The CORR aggregate
+# ---------------------------------------------------------------------------
+
+
+def test_corr_matches_the_known_correlation(real_database: Database) -> None:
+    """CORR reproduces pandas' Pearson value for response time and rating.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    with read_only_connection(real_database.path) as connection:
+        (value,) = connection.execute(
+            "SELECT ROUND(CORR(response_time_hrs, customer_rating), 3) FROM tickets"
+        ).fetchone()
+
+    assert value == -0.078
+
+
+@pytest.mark.parametrize(
+    ("pairs", "expected"),
+    [
+        ([(1, 2), (2, 4), (3, 6)], 1.0),
+        ([(1, 6), (2, 4), (3, 2)], -1.0),
+        # NULLs are skipped, as by every built-in aggregate.
+        ([(1, 2), (None, 9), (2, 4), (3, None), (3, 6)], 1.0),
+        # Undefined, not zero: one pair, or a column with no spread.
+        ([(1, 2)], None),
+        ([(1, 5), (2, 5), (3, 5)], None),
+    ],
+)
+def test_corr_edge_cases(
+    real_database: Database, pairs: list[tuple[float | None, float | None]], expected: float | None
+) -> None:
+    """CORR handles perfect, NULL-bearing and undefined inputs.
+
+    Args:
+        real_database: Any database; only the connection's function is used.
+        pairs: ``(x, y)`` values to correlate.
+        expected: The correlation, or ``None`` where it is undefined.
+    """
+    values = " UNION ALL ".join(
+        f"SELECT {'NULL' if x is None else x} AS x, {'NULL' if y is None else y} AS y"
+        for x, y in pairs
+    )
+    with read_only_connection(real_database.path) as connection:
+        (value,) = connection.execute(f"SELECT CORR(x, y) FROM ({values})").fetchone()
+
+    if expected is None:
+        assert value is None
+    else:
+        assert value == pytest.approx(expected)
