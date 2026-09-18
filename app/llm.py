@@ -59,12 +59,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Protocol, runtime_checkable
 
-from app.anomalies import detect_anomalies, load_frame
+from app.anomalies import UnknownDetectorError, detect_anomalies, load_frame
 from app.config import settings
 from app.data import QueryTimeoutError, execute_select, read_only_connection
-from app.grounding import ungrounded_numbers
+from app.grounding import extract_numbers, ungrounded_numbers
 from app.prompts import (
     ANOMALY_TOOL,
+    NARRATION_ROW_LIMIT,
     QUERY_TOOL,
     REFUSAL_MESSAGE,
     build_narration_messages,
@@ -174,6 +175,8 @@ class ChatResponse:
         completion_tokens: Tokens generated, including reasoning tokens.
         declined: Whether the model deliberately refused to call a tool. A
             considered judgement, not a failure - and therefore final.
+        usage_estimated: Whether the token counts are an estimate rather than
+            the provider's own figures. See :func:`_estimate_tokens`.
     """
 
     text: str | None = None
@@ -181,6 +184,59 @@ class ChatResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     declined: bool = False
+    usage_estimated: bool = False
+
+
+@dataclass
+class _Usage:
+    """Token usage accumulated across the model calls for one question.
+
+    Passed through the pipeline and added to in place, rather than threading
+    two integers through every method - which also leaves room for the one
+    fact integers cannot carry: whether any of the figures were estimated.
+
+    Attributes:
+        prompt_tokens: Input tokens across every call so far.
+        completion_tokens: Generated tokens across every call so far.
+        estimated: Whether any contributing call reported estimated usage.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    estimated: bool = False
+
+    def add(self, response: ChatResponse) -> None:
+        """Add one call's usage to the running totals.
+
+        Args:
+            response: A completed model call.
+        """
+        self.prompt_tokens += response.prompt_tokens
+        self.completion_tokens += response.completion_tokens
+        self.estimated = self.estimated or response.usage_estimated
+
+
+# Roughly four characters per token for English prose and code - the same
+# approximation the prompt budget tests use.
+_CHARS_PER_TOKEN: Final[int] = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    """Approximate the token count of a piece of text.
+
+    Used only where the provider spends tokens without reporting them: a
+    request it rejects with ``tool_use_failed`` returns an error body with no
+    usage figures, although the model read the whole prompt and generated a
+    reply. Recording zero there understated the cost of exactly the questions
+    that went wrong. The estimate is flagged as such all the way to the API.
+
+    Args:
+        text: The text to measure.
+
+    Returns:
+        An approximate token count.
+    """
+    return len(text) // _CHARS_PER_TOKEN
 
 
 @runtime_checkable
@@ -324,13 +380,24 @@ class GroqChatClient:
             except Exception as exc:  # noqa: BLE001 - classified immediately below
                 declined = _declined_to_use_a_tool(exc)
                 if declined is not None:
+                    # The provider rejected the request but the model still
+                    # read the prompt and wrote a reply, and none of that is
+                    # reported. Estimated rather than recorded as zero.
+                    estimated_usage = {
+                        "prompt_tokens": _estimate_tokens(
+                            json.dumps(messages) + json.dumps(tools or [])
+                        ),
+                        "completion_tokens": _estimate_tokens(declined),
+                        "usage_estimated": True,
+                    }
+
                     recovered = _recover_tool_call(declined)
                     if recovered is not None:
                         # The model meant to call a tool and merely formatted
                         # it wrongly. Its intent is clear, so it is honoured
                         # rather than surfaced as a refusal.
                         logger.info("Recovered a malformed %s call", recovered.name)
-                        return ChatResponse(tool_calls=[recovered])
+                        return ChatResponse(tool_calls=[recovered], **estimated_usage)
 
                     # Not a failure. Groq rejects the whole request when
                     # tool_choice="required" and the model chooses to answer in
@@ -342,7 +409,7 @@ class GroqChatClient:
                     # should not call a tool. Surfacing it as HTTP 400 would
                     # turn well-judged behaviour into what looks like a broken
                     # service.
-                    return ChatResponse(text=declined, declined=True)
+                    return ChatResponse(text=declined, declined=True, **estimated_usage)
 
                 last_error = exc
 
@@ -449,6 +516,53 @@ def _recover_tool_call(generated: str) -> ToolCall | None:
     return ToolCall(name=str(name), arguments=cleaned)
 
 
+class InvalidToolArgumentsError(ValueError):
+    """Raised when the model supplies tool arguments of the wrong shape."""
+
+
+def _anomaly_arguments(arguments: dict[str, Any]) -> tuple[str | None, int | None]:
+    """Validate the model's arguments for the anomaly tool.
+
+    Checked here, before anything runs, so that a malformed argument is told
+    apart from a fault inside a detector. Both used to surface as the same
+    ``TypeError`` or ``ValueError``.
+
+    Args:
+        arguments: The tool call's arguments.
+
+    Returns:
+        A ``(kind, window_days)`` pair. Either may be ``None``, meaning every
+        detector and all history respectively.
+
+    Raises:
+        InvalidToolArgumentsError: If ``kind`` is not text, or ``window_days``
+            is not a whole number of days, or is negative.
+    """
+    kind = arguments.get("kind")
+    if kind is not None and not isinstance(kind, str):
+        raise InvalidToolArgumentsError(f"the detector name {kind!r} is not text")
+
+    raw_window = arguments.get("window_days")
+    # 0 and an empty value both mean "no window"; the schema describes omitting
+    # the argument for all history, and models sometimes send 0 for that.
+    if raw_window in (None, "", 0):
+        return kind or None, None
+
+    # bool is a subclass of int, so True would otherwise read as one day.
+    if isinstance(raw_window, bool):
+        raise InvalidToolArgumentsError(f"window_days {raw_window!r} is not a number of days")
+    try:
+        window_days = int(raw_window)
+    except (TypeError, ValueError):
+        raise InvalidToolArgumentsError(
+            f"window_days {raw_window!r} is not a number of days"
+        ) from None
+    if window_days < 0:
+        raise InvalidToolArgumentsError(f"window_days {window_days} cannot be negative")
+
+    return kind or None, window_days
+
+
 def _translate_provider_error(exc: Exception | None) -> LlmError:
     """Convert a provider exception into this module's own error type.
 
@@ -463,13 +577,34 @@ def _translate_provider_error(exc: Exception | None) -> LlmError:
     Returns:
         The equivalent :class:`LlmError` subclass, ready to raise.
     """
-    from groq import APIConnectionError, APIStatusError, RateLimitError
+    from groq import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
     if isinstance(exc, RateLimitError):
+        retry_after = _retry_after_seconds(exc)
+        # Which limit was hit is not stated, because it cannot be known from
+        # here: the free tier enforces per-minute request and token limits and
+        # a per-day token limit, and the daily one - the one a heavy session
+        # actually exhausts - is not reported in the response headers. Saying
+        # "per minute" sent people back after a minute to fail again.
+        wait = (
+            f" Try again in about {_describe_wait(retry_after)}."
+            if retry_after is not None
+            else " Wait a minute, then try again; if it persists, the daily "
+            "token allowance may be spent."
+        )
         return LlmRateLimitedError(
             "The model provider's rate limit has been reached. The free tier "
-            "allows 30 requests and 8,000 tokens per minute.",
-            retry_after=_retry_after_seconds(exc),
+            "limits requests and tokens per minute, and tokens per day." + wait,
+            retry_after=retry_after,
+        )
+
+    # Before APIConnectionError, which it subclasses: a timeout reached the
+    # provider and waited, which calls for a different message from a
+    # connection that never got through.
+    if isinstance(exc, APITimeoutError):
+        return LlmUnavailableError(
+            f"The model provider did not respond within "
+            f"{settings.llm_timeout_seconds:g} seconds. Try again shortly."
         )
 
     if isinstance(exc, APIConnectionError):
@@ -485,6 +620,21 @@ def _translate_provider_error(exc: Exception | None) -> LlmError:
     return LlmUnavailableError(
         f"The model provider failed unexpectedly: {exc}"
     )
+
+
+def _describe_wait(seconds: float) -> str:
+    """Phrase a wait in the unit a person would use.
+
+    Args:
+        seconds: The wait the provider asked for.
+
+    Returns:
+        A short duration such as "45 seconds" or "12 minutes".
+    """
+    whole = max(1, round(seconds))
+    if whole < 120:
+        return f"{whole} second{'s' if whole != 1 else ''}"
+    return f"{round(whole / 60)} minutes"
 
 
 def is_retryable(exc: Exception) -> bool:
@@ -507,11 +657,20 @@ def is_retryable(exc: Exception) -> bool:
     Returns:
         ``True`` when the failure is transient and a retry is justified.
     """
-    from groq import APIConnectionError, APIStatusError, RateLimitError
+    from groq import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
     # Checked before APIStatusError, which RateLimitError subclasses - the
     # order here is what makes the 429 exclusion actually hold.
     if isinstance(exc, RateLimitError):
+        return False
+
+    # A timeout is not retried, and must be checked before APIConnectionError,
+    # which it subclasses. A call that has already waited the full timeout is
+    # unlikely to be faster a second time - and retrying it tripled the wait:
+    # three attempts of 30 seconds, on each of up to four calls per question,
+    # kept the server working for minutes after the interface had given up
+    # and told the user the request failed - still spending tokens.
+    if isinstance(exc, APITimeoutError):
         return False
 
     # A dropped or refused connection never reached the provider, so nothing
@@ -624,8 +783,10 @@ class QueryResult:
         as_of: Reference time used to resolve relative dates.
         elapsed_ms: Wall-clock duration of the whole pipeline.
         model: Model identifier that answered.
-        prompt_tokens: Total input tokens across both calls.
-        completion_tokens: Total generated tokens across both calls.
+        prompt_tokens: Total input tokens across every model call.
+        completion_tokens: Total generated tokens across every model call.
+        tokens_estimated: Whether any of those figures were estimated because
+            the provider did not report them.
     """
 
     question: str
@@ -641,6 +802,7 @@ class QueryResult:
     model: str
     prompt_tokens: int
     completion_tokens: int
+    tokens_estimated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view of this result.
@@ -662,6 +824,7 @@ class QueryResult:
             "model": self.model,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "tokens_estimated": self.tokens_estimated,
         }
 
 
@@ -718,8 +881,7 @@ class TicketQueryService:
             raise ValueError("A question is required.")
 
         started = time.monotonic()
-        prompt_tokens = 0
-        completion_tokens = 0
+        usage = _Usage()
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
@@ -732,8 +894,7 @@ class TicketQueryService:
             force_tool=True,
             max_tokens=TOOL_CALL_MAX_TOKENS,
         )
-        prompt_tokens += selection.prompt_tokens
-        completion_tokens += selection.completion_tokens
+        usage.add(selection)
 
         if selection.declined:
             # The model judged that no tool applies - to "what is the capital
@@ -746,13 +907,22 @@ class TicketQueryService:
             # knowledge. Overriding a correct refusal is how an ungrounded
             # answer gets manufactured, which is the one failure this whole
             # design exists to prevent.
-            logger.info("Model declined to use a tool for: %s", question)
+            #
+            # The model's *judgement* stands; its *wording* does not. Its prose
+            # is unverified by definition - no data sits behind it - and the
+            # benchmark caught it answering "why use the IQR?" with a
+            # multi-section essay from general knowledge, delivered as a
+            # "refusal". A fixed message cannot carry an ungrounded claim.
+            logger.info(
+                "Model declined to use a tool for: %s | its reply: %.200s",
+                question,
+                selection.text,
+            )
             return self._declined(
                 question,
-                answer=selection.text or REFUSAL_MESSAGE,
+                answer=REFUSAL_MESSAGE,
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                usage=usage,
             )
 
         if not selection.tool_calls:
@@ -778,31 +948,37 @@ class TicketQueryService:
                 force_tool=True,
                 max_tokens=TOOL_CALL_MAX_TOKENS,
             )
-            prompt_tokens += selection.prompt_tokens
-            completion_tokens += selection.completion_tokens
+            usage.add(selection)
 
         if not selection.tool_calls:
             # Two prose replies to an explicit instruction. Passing it through
             # would publish an ungrounded answer, which is precisely what this
-            # pipeline exists to prevent, so the question is declined instead.
-            logger.warning("Model returned no tool call for: %s", question)
+            # pipeline exists to prevent, so the question is declined instead -
+            # with the fixed message, never the prose itself.
+            logger.warning(
+                "Model returned no tool call for: %s | its reply: %.200s",
+                question,
+                selection.text,
+            )
             return self._declined(
                 question,
-                answer=selection.text or REFUSAL_MESSAGE,
+                answer=REFUSAL_MESSAGE,
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                usage=usage,
             )
 
         call = selection.tool_calls[0]
+        # The model's decision, in full - the first thing to check when an
+        # answer is wrong is whether the right tool was chosen, with the right
+        # arguments, before anything downstream had a chance to go wrong.
+        logger.debug("Model chose %s with arguments %s", call.name, call.arguments)
 
         if call.name == ANOMALY_TOOL:
             return self._answer_with_anomalies(
                 question,
                 call,
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                usage=usage,
             )
 
         if call.name == QUERY_TOOL:
@@ -811,8 +987,7 @@ class TicketQueryService:
                 call,
                 messages=messages,
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                usage=usage,
             )
 
         logger.error("Model requested an unknown tool: %s", call.name)
@@ -820,8 +995,7 @@ class TicketQueryService:
             question,
             answer=REFUSAL_MESSAGE,
             started=started,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            usage=usage,
         )
 
     def _answer_with_query(
@@ -831,8 +1005,7 @@ class TicketQueryService:
         *,
         messages: list[dict[str, Any]],
         started: float,
-        prompt_tokens: int,
-        completion_tokens: int,
+        usage: _Usage,
     ) -> QueryResult:
         """Validate, execute and narrate a generated SQL query.
 
@@ -847,8 +1020,7 @@ class TicketQueryService:
             call: The model's tool call.
             messages: The conversation so far, reused for the repair attempt.
             started: Monotonic start time of the pipeline.
-            prompt_tokens: Input tokens consumed so far.
-            completion_tokens: Generated tokens so far.
+            usage: Token usage accumulated so far for this question.
 
         Returns:
             The narrated answer, or an explanation of why none could be given.
@@ -859,9 +1031,16 @@ class TicketQueryService:
         failure: str | None = None
 
         for attempt in (1, 2):
+            # Reset per attempt, so a failure reports the statement that
+            # failed. Carried over, a first query that validated but failed
+            # to run was shown beside the *second* attempt's error.
+            safe_sql = None
             try:
                 safe_sql = validate_select(sql, max_rows=self._max_rows)
                 rows = self._execute(safe_sql)
+                # The statement as executed - after validation and the added
+                # LIMIT - which can differ from what the model wrote.
+                logger.debug("Executed SQL (%d rows): %s", len(rows), safe_sql)
                 failure = None
                 break
             except QueryTimeoutError as exc:
@@ -874,8 +1053,7 @@ class TicketQueryService:
                     question,
                     answer=str(exc),
                     started=started,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
+                    usage=usage,
                     sql=safe_sql,
                 )
             except (SqlGuardError, sqlite3.Error) as exc:
@@ -902,12 +1080,25 @@ class TicketQueryService:
                     force_tool=True,
                     max_tokens=TOOL_CALL_MAX_TOKENS,
                 )
-                prompt_tokens += repair.prompt_tokens
-                completion_tokens += repair.completion_tokens
+                usage.add(repair)
 
                 if not repair.tool_calls:
                     break
-                sql = str(repair.tool_calls[0].arguments.get("sql", "")).strip()
+
+                correction = repair.tool_calls[0]
+                if correction.name == ANOMALY_TOOL:
+                    # On reflection the model chose the detectors instead - a
+                    # legitimate correction, since some questions fit either
+                    # tool. Honoured, rather than reading a "sql" argument the
+                    # call does not have and reporting "No SQL statement was
+                    # provided" for a question that can be answered.
+                    logger.info("Repair switched to %s", ANOMALY_TOOL)
+                    return self._answer_with_anomalies(
+                        question, correction, started=started, usage=usage
+                    )
+                if correction.name != QUERY_TOOL:
+                    break
+                sql = str(correction.arguments.get("sql", "")).strip()
 
         if failure is not None:
             return self._declined(
@@ -917,9 +1108,10 @@ class TicketQueryService:
                     f"dataset. The database reported: {failure}"
                 ),
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                sql=safe_sql,
+                usage=usage,
+                # The statement that produced this failure: the validated form
+                # when it got that far, otherwise the text the guard rejected.
+                sql=safe_sql or sql or None,
             )
 
         shown, truncated = truncate_rows(rows)
@@ -931,10 +1123,9 @@ class TicketQueryService:
             fallback=_describe_rows(rows),
             result_count=len(rows),
             rows=rows,
-            truncated=truncated,
+            required_totals=[(len(rows), f"{len(rows)} tickets matched.")] if truncated else None,
         )
-        prompt_tokens += narration.prompt_tokens
-        completion_tokens += narration.completion_tokens
+        usage.add(narration)
 
         return QueryResult(
             question=question,
@@ -948,8 +1139,9 @@ class TicketQueryService:
             as_of=self._as_of,
             elapsed_ms=_elapsed_ms(started),
             model=self._client.model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            tokens_estimated=usage.estimated,
         )
 
     def _answer_with_anomalies(
@@ -958,8 +1150,7 @@ class TicketQueryService:
         call: ToolCall,
         *,
         started: float,
-        prompt_tokens: int,
-        completion_tokens: int,
+        usage: _Usage,
     ) -> QueryResult:
         """Run the anomaly detectors and narrate their reports.
 
@@ -967,36 +1158,43 @@ class TicketQueryService:
             question: The original question.
             call: The model's tool call.
             started: Monotonic start time of the pipeline.
-            prompt_tokens: Input tokens consumed so far.
-            completion_tokens: Generated tokens so far.
+            usage: Token usage accumulated so far for this question.
 
         Returns:
             The narrated answer.
         """
-        kind = call.arguments.get("kind")
-        window_days = call.arguments.get("window_days")
-
         try:
+            kind, window_days = _anomaly_arguments(call.arguments)
             reports = detect_anomalies(
                 load_frame(self._db_path),
                 as_of=self._as_of,
                 kinds=[kind] if kind else None,
-                window_days=int(window_days) if window_days else None,
+                window_days=window_days,
             )
-        except (KeyError, ValueError, TypeError, sqlite3.Error) as exc:
+        except (InvalidToolArgumentsError, UnknownDetectorError, sqlite3.Error) as exc:
             # The model chose arguments the detectors reject. Reported rather
             # than retried: the tool schema already constrains these values, so
             # a second attempt is unlikely to differ.
+            #
+            # Only these are caught. This once caught KeyError, ValueError and
+            # TypeError wholesale, so a bug inside a detector was reported to
+            # the user as a problem with the model's arguments - and hidden.
             logger.info("Anomaly arguments rejected: %s", exc)
             return self._declined(
                 question,
                 answer=f"I could not run that anomaly check: {exc}",
                 started=started,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                usage=usage,
             )
 
         payloads = [report.to_dict() for report in reports]
+
+        # The narration shows at most NARRATION_ROW_LIMIT tickets per report,
+        # so a report above that is a sample - 80 SLA breaches, of which the
+        # model sees 20. Each such report's own total must reach the reader;
+        # one combined figure would not tell them which detector it belongs to.
+        sampled = [p for p in payloads if p["count"] > NARRATION_ROW_LIMIT]
+
         answer, narration = self._narrate(
             question,
             evidence=render_anomaly_reports(payloads),
@@ -1005,9 +1203,12 @@ class TicketQueryService:
             # No rows are passed: the reports already carry every figure the
             # model was shown - thresholds, counts and each ticket's value.
             reports=payloads,
+            required_totals=[
+                (p["count"], f"{p['description']}: {p['count']} flagged.")
+                for p in sampled
+            ],
         )
-        prompt_tokens += narration.prompt_tokens
-        completion_tokens += narration.completion_tokens
+        usage.add(narration)
 
         flagged = [
             anomaly for payload in payloads for anomaly in payload["anomalies"]
@@ -1020,13 +1221,14 @@ class TicketQueryService:
             sql=None,
             rows=flagged,
             row_count=len(flagged),
-            truncated=False,
+            truncated=bool(sampled),
             anomaly_reports=payloads,
             as_of=self._as_of,
             elapsed_ms=_elapsed_ms(started),
             model=self._client.model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            tokens_estimated=usage.estimated,
         )
 
     def _narrate(
@@ -1038,7 +1240,7 @@ class TicketQueryService:
         result_count: int = 0,
         rows: list[dict[str, Any]] | None = None,
         reports: list[dict[str, Any]] | None = None,
-        truncated: bool = False,
+        required_totals: list[tuple[int, str]] | None = None,
     ) -> tuple[str, ChatResponse]:
         """Ask the model to phrase an answer, degrading to a plain summary.
 
@@ -1057,6 +1259,13 @@ class TicketQueryService:
             question: The original question.
             evidence: Rendered tool output to narrate.
             fallback: A factual summary to use if the model is unavailable.
+            result_count: How many results the evidence describes in full.
+            rows: Query rows behind the evidence, for the grounding check.
+            reports: Anomaly reports behind the evidence, likewise.
+            required_totals: ``(total, sentence)`` pairs for every result set
+                the model saw only a sample of. When the answer does not state
+                a total, its sentence is prefixed so the reader knows the
+                listing is partial.
 
         Returns:
             An ``(answer, response)`` pair. On failure the response carries zero
@@ -1096,6 +1305,7 @@ class TicketQueryService:
             reports=reports,
             question=question,
             row_count=result_count,
+            evidence=evidence,
         )
         if invented:
             # A figure with no source in the evidence was not computed - it was
@@ -1111,15 +1321,14 @@ class TicketQueryService:
             )
             return fallback, narration
 
-        if truncated and result_count > 0 and not _states_the_total(text, result_count):
-            # The model listed a sample without saying so. Observed twice: 13
-            # of 34 matching tickets named as though they were all of them.
-            # The reader has no way to know the list is partial, so the total
-            # is stated for them rather than left to chance.
-            logger.info("Answer omitted the total for a truncated result")
-            text = f"{result_count} tickets matched. {text}"
-
-        if result_count > 0 and _claims_no_results(text):
+        # Checked on the model's own words, before any total is prefixed below:
+        # the prefix states a figure, which would exempt the answer from this
+        # check (see _claims_no_results) and let a contradiction through.
+        if (
+            result_count > 0
+            and not _result_is_zero(rows)
+            and _claims_no_results(text)
+        ):
             # The model has contradicted data already in hand. Observed against
             # the live model on a query returning 34 unresolved tickets: the
             # column was mostly NULL and it reported "No tickets matched."
@@ -1134,6 +1343,19 @@ class TicketQueryService:
                 result_count,
             )
             return fallback, narration
+
+        # The model saw a sample and may have listed it without saying so -
+        # observed twice: 13 of 34 matching tickets named as though they were
+        # all of them. The reader cannot tell the list is partial, so every
+        # total the answer leaves out is stated for them, not left to chance.
+        missing = [
+            sentence
+            for total, sentence in required_totals or []
+            if total > 0 and not _states_the_total(text, total)
+        ]
+        if missing:
+            logger.info("Answer omitted %d total(s) for a sampled result", len(missing))
+            text = f"{' '.join(missing)} {text}"
 
         return text, narration
 
@@ -1160,8 +1382,7 @@ class TicketQueryService:
         *,
         answer: str,
         started: float,
-        prompt_tokens: int,
-        completion_tokens: int,
+        usage: _Usage,
         sql: str | None = None,
     ) -> QueryResult:
         """Build a result for a question that could not be answered.
@@ -1174,8 +1395,7 @@ class TicketQueryService:
             question: The original question.
             answer: Explanation to show the user.
             started: Monotonic start time of the pipeline.
-            prompt_tokens: Input tokens consumed.
-            completion_tokens: Generated tokens.
+            usage: Token usage accumulated so far for this question.
             sql: The offending SQL, when there was some.
 
         Returns:
@@ -1193,8 +1413,9 @@ class TicketQueryService:
             as_of=self._as_of,
             elapsed_ms=_elapsed_ms(started),
             model=self._client.model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            tokens_estimated=usage.estimated,
         )
 
 
@@ -1210,28 +1431,88 @@ _EMPTY_CLAIM_PATTERN: Final[re.Pattern[str]] = re.compile(
 
 
 def _claims_no_results(text: str) -> bool:
-    """Report whether an answer asserts that nothing was found.
+    """Report whether an answer asserts that nothing at all was found.
+
+    The phrase alone is not enough. "40 are open and no tickets were
+    escalated" contains "no tickets" but describes a result - and matching the
+    phrase anywhere replaced exactly that kind of correct answer with the
+    blunt deterministic summary. A blanket claim of emptiness states no figure
+    about the result, so an answer that does state one is not making it.
+    Years are ignored when looking for a figure: they are context, and "no
+    tickets in 2024" is still a blanket claim.
 
     Args:
         text: The model's answer.
 
     Returns:
-        ``True`` when the answer claims an empty result.
+        ``True`` when the answer claims an empty result and states no figure.
     """
-    return bool(_EMPTY_CLAIM_PATTERN.search(text))
+    if not _EMPTY_CLAIM_PATTERN.search(text):
+        return False
+    figures = [
+        token
+        for token in _figures(text)
+        if not (len(token) == 4 and token.isdigit() and 1900 <= int(token) < 2100)
+    ]
+    return not figures
+
+
+# Identifiers such as TKT-108 and AGT-05. Their digits name a ticket or an
+# agent; they are not quantities, and must not be mistaken for one.
+_IDENTIFIER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b[A-Za-z]{2,}-\d+\b")
+
+
+def _figures(text: str) -> list[str]:
+    """Return the quantities stated in an answer, ignoring identifiers.
+
+    Args:
+        text: The model's answer.
+
+    Returns:
+        Numeric figures as written, with ticket and agent ids removed first.
+    """
+    return extract_numbers(_IDENTIFIER_PATTERN.sub(" ", text))
+
+
+def _result_is_zero(rows: list[dict[str, Any]] | None) -> bool:
+    """Report whether a result, though it has rows, says "nothing".
+
+    ``SELECT COUNT(*) ... WHERE created_at < '2024-01-01'`` returns one row
+    holding 0. "No tickets were created in 2023" is then the correct answer,
+    not a contradiction of the data, and must not be overruled.
+
+    Args:
+        rows: The query result, or ``None`` for an anomaly answer.
+
+    Returns:
+        ``True`` when every value in every row is zero or NULL.
+    """
+    if not rows:
+        return False
+    return all(
+        value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0)
+        for row in rows
+        for value in row.values()
+    )
 
 
 def _states_the_total(text: str, total: int) -> bool:
     """Report whether an answer mentions the full number of matching rows.
+
+    Compared as whole figures, not as substrings. A substring check read a
+    total of 34 as "stated" in any answer containing "TKT-340" or "134", and
+    so left a partial listing unlabelled. Identifiers are excluded for the same
+    reason - with 108 matches, listing TKT-108 does not state the total - and
+    figures written in words count.
 
     Args:
         text: The model's answer.
         total: How many rows matched in full.
 
     Returns:
-        ``True`` when the total appears in the answer.
+        ``True`` when the total appears in the answer as a figure of its own.
     """
-    return str(total) in text.replace(",", "")
+    return str(total) in _figures(text)
 
 
 def _describe_rows(rows: list[dict[str, Any]]) -> str:
@@ -1253,7 +1534,13 @@ def _describe_rows(rows: list[dict[str, Any]]) -> str:
     # worth answering directly rather than reporting "1 row".
     if len(rows) == 1 and len(rows[0]) == 1:
         (column, value), = rows[0].items()
-        return f"{column.replace('_', ' ')}: {value}"
+        label = column.replace("_", " ")
+        if value is None:
+            # An aggregate over no values - the average rating of unresolved
+            # tickets, which carry no rating. Python's "None" means nothing to
+            # a reader; the reason does.
+            return f"{label}: no value - there was nothing to aggregate."
+        return f"{label}: {value}"
 
     return f"{len(rows)} rows matched. The full result is included below."
 
@@ -1269,10 +1556,25 @@ def _describe_reports(reports: list[dict[str, Any]]) -> str:
     """
     parts = [
         f"{report['description']}: {report['count']} of {report['considered']} "
-        f"flagged (threshold {report['threshold']})"
+        f"flagged ({_describe_threshold(report['threshold'])})"
         for report in reports
     ]
     return ". ".join(parts) + "."
+
+
+def _describe_threshold(threshold: float | None) -> str:
+    """Phrase a detector's threshold for a reader.
+
+    Args:
+        threshold: The boundary applied, or ``None`` when too little data
+            existed to derive one.
+
+    Returns:
+        The threshold, or the reason there is none - never Python's "None".
+    """
+    if threshold is None:
+        return "no threshold - too few resolved tickets to derive one"
+    return f"threshold {threshold:g}"
 
 
 def _elapsed_ms(started: float) -> int:

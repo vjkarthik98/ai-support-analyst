@@ -92,8 +92,18 @@ class QueryResponse(BaseModel):
     )
     elapsed_ms: int = Field(description="Total round-trip time in milliseconds.")
     model: str = Field(description="The model that answered.")
-    prompt_tokens: int = Field(description="Input tokens across both calls.")
-    completion_tokens: int = Field(description="Generated tokens across both calls.")
+    prompt_tokens: int = Field(description="Input tokens across every model call.")
+    completion_tokens: int = Field(
+        description="Generated tokens across every model call."
+    )
+    tokens_estimated: bool = Field(
+        default=False,
+        description=(
+            "True when part of the token count is an estimate. The provider "
+            "reports no usage for a request it rejects - such as a model "
+            "declining to call a tool - although tokens were still spent."
+        ),
+    )
 
 
 class AnomalyItem(BaseModel):
@@ -170,6 +180,9 @@ class HealthResponse(BaseModel):
     status: str = Field(description="'ok' when the service is ready.")
     version: str = Field(description="Running application version.")
     dataset_rows: int = Field(description="Tickets loaded into the database.")
+    dataset_file: str = Field(
+        description="Name of the CSV file the tickets were loaded from."
+    )
     as_of: str = Field(
         description="Reference time for relative date expressions."
     )

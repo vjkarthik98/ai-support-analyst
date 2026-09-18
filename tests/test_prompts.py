@@ -99,6 +99,67 @@ def test_system_prompt_shows_relative_date_examples() -> None:
     assert "'now'" not in prompt
 
 
+def test_system_prompt_shows_named_month_matching() -> None:
+    """Named months are matched on a zero-padded year-month string.
+
+    Without this guidance the model has to guess, and both of SQLite's traps
+    fail silently with zero rows rather than an error:
+    ``strftime('%m', ...) = '3'`` matches nothing because months are padded,
+    and ``strftime('%B', ...)`` returns NULL because SQLite has no month
+    names. Benchmark question 27 ("Were more tickets raised in March than in
+    January?") was answered "March had no recorded tickets" because of this.
+    """
+    prompt = build_system_prompt(AS_OF, row_count=500)
+
+    assert "strftime('%Y-%m', created_at)" in prompt
+    # The year comes from the anchor, so an unqualified month is pinned to
+    # the dataset's own year.
+    assert f"'{AS_OF:%Y}-02'" in prompt
+    # Both silent failure modes are named, so the model is steered off them.
+    assert "zero-padded" in prompt
+    assert "'%B'" in prompt
+
+
+def test_last_month_example_applies_start_of_month_first() -> None:
+    """"Last month" is taught with the modifier order that cannot overflow.
+
+    30 March minus one month is "30 February", which SQLite normalises to 1
+    March, so the reverse order resolves "last month" to the current month.
+    Benchmark question 43 compared March with February and got March alone.
+    """
+    prompt = build_system_prompt(AS_OF, row_count=500)
+
+    assert "'start of month', '-1 month'" in prompt
+    assert "'-1 month', 'start of month'" not in prompt
+
+
+def test_every_date_example_passes_the_sql_guard() -> None:
+    """The prompt never teaches an expression the guard would reject.
+
+    The guard now refuses wall-clock dates and overflowing month arithmetic.
+    An example that tripped either would train the model into a rejection and
+    a wasted repair call on every question that used it.
+    """
+    import re
+
+    from app.sql_guard import validate_select
+
+    prompt = build_system_prompt(AS_OF, row_count=500)
+    expressions = re.findall(r"(?:datetime|strftime)\([^)]*\)", prompt)
+
+    assert expressions, "no date examples found in the prompt"
+    for expression in expressions:
+        validate_select(f"SELECT COUNT(*) FROM tickets WHERE created_at >= {expression}")
+
+
+def test_named_month_year_follows_the_anchor() -> None:
+    """A pinned ``AS_OF`` in another year moves the month examples with it."""
+    prompt = build_system_prompt(datetime(2023, 1, 15, 9, 0), row_count=42)
+
+    assert "'2023-02'" in prompt
+    assert "'2024-02'" not in prompt
+
+
 def test_anchor_changes_with_the_supplied_time() -> None:
     """The prompt reflects whichever anchor it is given.
 
@@ -418,6 +479,43 @@ def test_narration_forbids_inventing_figures() -> None:
 
     assert "Never estimate" in system
     assert "exactly" in system
+
+
+def test_narration_requires_digits_for_figures() -> None:
+    """Figures are written in digits, including at the start of a sentence.
+
+    English style says not to open a sentence with a numeral, so without this
+    rule the model wrote "Six tickets this week were resolution-time
+    outliers." Digits keep answers consistent and checkable at a glance.
+    """
+    system = build_narration_messages("q", evidence="data", as_of=AS_OF)[0]["content"]
+
+    assert "digits" in system
+    assert "never 'Six'" in system
+
+
+def test_narration_forbids_claiming_trends() -> None:
+    """Figures are reported without inventing a relationship between them.
+
+    Asked whether response time relates to rating, the model saw averages of
+    3.86, 3.76 and 3.67 across three response-time bands and declared "an
+    inverse relationship". The true correlation is -0.078 - effectively none.
+    Every figure was grounded; the conclusion drawn from them was not.
+    """
+    system = build_narration_messages("q", evidence="data", as_of=AS_OF)[0]["content"]
+
+    assert "not trends or causes" in system
+
+
+def test_narration_explains_a_null_average() -> None:
+    """A NULL aggregate is explained rather than quoted as a value.
+
+    "The average rating for unresolved tickets is NULL" is true and useless:
+    the reader needs to hear that unresolved tickets carry no rating at all.
+    """
+    system = build_narration_messages("q", evidence="data", as_of=AS_OF)[0]["content"]
+
+    assert "NULL average means" in system
 
 
 def test_narration_prompt_is_small() -> None:

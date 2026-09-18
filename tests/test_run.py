@@ -24,7 +24,7 @@ from collections.abc import Iterator
 import pytest
 
 from app.config import settings
-from run import check_ports, port_is_free
+from run import check_ports, port_is_free, wait_for_first_exit
 
 
 @pytest.fixture
@@ -194,3 +194,48 @@ def test_both_conflicts_are_reported_together(
     monkeypatch.setattr(settings, "ui_port", occupied_port)
 
     assert len(check_ports()) == 2
+
+
+class _FakeProcess:
+    """Stands in for a child process that exits after a set number of polls."""
+
+    def __init__(self, polls_until_exit: int | None) -> None:
+        """Initialise the fake.
+
+        Args:
+            polls_until_exit: How many ``poll()`` calls report it running
+                before it exits, or ``None`` to run forever.
+        """
+        self._remaining = polls_until_exit
+
+    def poll(self) -> int | None:
+        """Report the exit code, mimicking ``subprocess.Popen.poll``.
+
+        Returns:
+            ``None`` while running, then an exit code.
+        """
+        if self._remaining is None:
+            return None
+        if self._remaining == 0:
+            return 1
+        self._remaining -= 1
+        return None
+
+
+def test_an_api_crash_mid_session_is_noticed() -> None:
+    """The launcher notices the API exiting, not only the UI.
+
+    It used to wait on the UI alone. An API that crashed mid-session left the
+    interface running and failing every question, while the terminal - where
+    the cause was visible - reported nothing.
+    """
+    processes = {"API": _FakeProcess(polls_until_exit=2), "UI": _FakeProcess(None)}
+
+    assert wait_for_first_exit(processes, poll_interval=0) == "API"
+
+
+def test_a_ui_exit_is_noticed() -> None:
+    """The UI exiting still ends the session, as it always did."""
+    processes = {"API": _FakeProcess(None), "UI": _FakeProcess(polls_until_exit=0)}
+
+    assert wait_for_first_exit(processes, poll_interval=0) == "UI"

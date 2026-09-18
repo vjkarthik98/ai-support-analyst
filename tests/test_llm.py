@@ -39,7 +39,7 @@ from app.llm import (
     build_chat_client,
     is_retryable,
 )
-from app.prompts import ANOMALY_TOOL, NARRATION_ROW_LIMIT, QUERY_TOOL
+from app.prompts import ANOMALY_TOOL, NARRATION_ROW_LIMIT, QUERY_TOOL, REFUSAL_MESSAGE
 
 AS_OF = datetime(2024, 3, 30, 18, 6)
 
@@ -629,19 +629,26 @@ def test_a_declined_question_is_not_retried(service_factory) -> None:
     assert len(client.calls) == 1
 
 
-def test_declined_answer_keeps_the_model_wording(service_factory) -> None:
-    """The model's own refusal is shown, not a generic substitute.
+def test_declined_answer_uses_the_fixed_refusal(service_factory) -> None:
+    """A decline shows the fixed refusal, never the model's own prose.
+
+    The model's wording was once passed through, on the reasoning that its
+    refusals read naturally. The benchmark disproved that: asked "why use the
+    interquartile range rather than a standard deviation?", the model declined
+    the tools and wrote a five-section essay from general knowledge, which
+    reached the user unverified. Prose with no data behind it cannot be
+    grounded, so none of it is shown.
 
     Args:
         service_factory: Factory building a service with a scripted client.
     """
-    service, _ = service_factory(
-        ChatResponse(text="I cannot fulfil that request.", declined=True)
-    )
+    essay = "### 1. Robustness\nThe IQR ignores the 25% of values in each tail."
+    service, _ = service_factory(ChatResponse(text=essay, declined=True))
 
-    assert service.answer("Delete all tickets.").answer == (
-        "I cannot fulfil that request."
-    )
+    result = service.answer("Why use the IQR rather than a standard deviation?")
+
+    assert result.answer == REFUSAL_MESSAGE
+    assert "25%" not in result.answer
 
 
 def test_prose_reply_triggers_one_retry(service_factory) -> None:
@@ -709,6 +716,9 @@ def test_two_prose_replies_are_declined(service_factory) -> None:
     assert result.tool is None
     assert result.rows == []
     assert len(client.calls) == 2  # no narration of an ungrounded answer
+    # The ungrounded prose itself must not reach the user either.
+    assert result.answer == REFUSAL_MESSAGE
+    assert "400" not in result.answer
 
 
 def test_unknown_tool_is_declined(service_factory) -> None:
@@ -1236,3 +1246,596 @@ def test_prose_is_not_mistaken_for_a_tool_call() -> None:
     assert _recover_tool_call("I can only answer questions about tickets.") is None
     assert _recover_tool_call('{"unrelated": "json"}') is None
     assert _recover_tool_call('{"name": "drop_everything", "arguments": {}}') is None
+
+
+# ---------------------------------------------------------------------------
+# Anomaly tool arguments - malformed input versus a genuine fault
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        pytest.param({"kind": ["sla_breach"]}, "is not text", id="kind as a list"),
+        pytest.param({"window_days": "a week"}, "not a number of days", id="window as prose"),
+        pytest.param({"window_days": True}, "not a number of days", id="window as a boolean"),
+        pytest.param({"window_days": -3}, "cannot be negative", id="negative window"),
+    ],
+)
+def test_malformed_anomaly_arguments_are_declined(
+    arguments: dict[str, Any], message: str, real_database: Database
+) -> None:
+    """Arguments of the wrong shape are declined with a specific reason.
+
+    Args:
+        arguments: The malformed tool arguments.
+        message: Text the explanation must contain.
+        real_database: Database built from the shipped dataset.
+    """
+    service = TicketQueryService(
+        client=FakeChatClient(tool_response(ANOMALY_TOOL, **arguments)),
+        db_path=real_database.path,
+        as_of=real_database.as_of,
+        row_count=real_database.row_count,
+    )
+
+    result = service.answer("Any anomalies?")
+
+    assert result.tool is None
+    assert message in result.answer
+
+
+def test_a_fault_inside_a_detector_is_not_disguised(
+    real_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug inside a detector surfaces as an error, not as a polite decline.
+
+    The anomaly path used to catch KeyError, ValueError and TypeError
+    wholesale, so a detector reading a missing column was reported to the user
+    as "I could not run that anomaly check" - hiding a defect behind a message
+    that blames the model's arguments.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+        monkeypatch: pytest's attribute patcher.
+    """
+    import app.llm as llm_module
+
+    def broken_detection(*args: Any, **kwargs: Any) -> Any:
+        raise KeyError("resolution_time_hrs")
+
+    monkeypatch.setattr(llm_module, "detect_anomalies", broken_detection)
+
+    service = TicketQueryService(
+        client=FakeChatClient(tool_response(ANOMALY_TOOL)),
+        db_path=real_database.path,
+        as_of=real_database.as_of,
+        row_count=real_database.row_count,
+    )
+
+    with pytest.raises(KeyError, match="resolution_time_hrs"):
+        service.answer("Any anomalies?")
+
+
+# ---------------------------------------------------------------------------
+# Token usage the provider does not report
+# ---------------------------------------------------------------------------
+
+
+def _tool_use_failed(generated: str) -> Exception:
+    """Build the provider error for a model that declined a forced tool call.
+
+    Args:
+        generated: What the model wrote instead of calling a tool.
+
+    Returns:
+        The SDK exception Groq raises, which carries no usage figures.
+    """
+    import httpx
+    from groq import BadRequestError
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat")
+    return BadRequestError(
+        "tool_use_failed",
+        response=httpx.Response(400, request=request),
+        body={"error": {"code": "tool_use_failed", "failed_generation": generated}},
+    )
+
+
+class _RaisingCompletions:
+    """Stands in for the SDK's ``chat.completions`` and raises one error."""
+
+    def __init__(self, error: Exception) -> None:
+        """Initialise with the error to raise.
+
+        Args:
+            error: The exception every call raises.
+        """
+        self._error = error
+
+    def create(self, **kwargs: Any) -> Any:
+        """Raise the configured error.
+
+        Args:
+            **kwargs: Ignored.
+
+        Raises:
+            Exception: Always.
+        """
+        raise self._error
+
+
+def _groq_client_raising(error: Exception) -> Any:
+    """Build a real GroqChatClient whose SDK calls raise ``error``.
+
+    Args:
+        error: The exception the SDK should raise.
+
+    Returns:
+        The client, making no network calls.
+    """
+    from types import SimpleNamespace
+
+    from app.llm import GroqChatClient
+
+    client = GroqChatClient(api_key="gsk_test_key", model="openai/gpt-oss-120b")
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=_RaisingCompletions(error))
+    )
+    return client
+
+
+@pytest.mark.parametrize(
+    "generated",
+    [
+        pytest.param("I can only answer questions about tickets.", id="a refusal"),
+        pytest.param(
+            '{"name": "detect_anomalies", "arguments": {}}', id="a tool call written as text"
+        ),
+    ],
+)
+def test_rejected_request_reports_estimated_usage(generated: str) -> None:
+    """A request the provider rejects still reports what it cost.
+
+    Groq's ``tool_use_failed`` error body carries no usage figures, although
+    the model read the whole prompt and wrote a reply. Recording zero
+    understated the cost of exactly the questions that went wrong.
+
+    Args:
+        generated: What the model wrote instead of a proper tool call.
+    """
+    client = _groq_client_raising(_tool_use_failed(generated))
+
+    response = client.complete(
+        [{"role": "user", "content": "x" * 4000}],
+        tools=[{"type": "function"}],
+        force_tool=True,
+    )
+
+    assert response.usage_estimated is True
+    # About 4,000 characters of prompt is about 1,000 tokens.
+    assert response.prompt_tokens >= 1000
+    assert response.completion_tokens > 0
+
+
+def test_estimated_usage_is_flagged_in_the_result(service_factory) -> None:
+    """An answer built on estimated usage says so; one built on reported usage does not.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        ChatResponse(
+            text="no", declined=True, prompt_tokens=900, usage_estimated=True
+        )
+    )
+    estimated = service.answer("What is the capital of France?")
+
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT COUNT(*) AS n FROM tickets"),
+        text_response("500 tickets."),
+    )
+    reported = service.answer("How many tickets?")
+
+    assert estimated.tokens_estimated is True
+    assert estimated.prompt_tokens == 900
+    assert reported.tokens_estimated is False
+    assert reported.to_dict()["tokens_estimated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Totals for sampled results, empty-result claims, and plain fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_a_sampled_anomaly_report_states_its_total(service_factory) -> None:
+    """An anomaly answer built on a sample states the full count.
+
+    The narration shows at most 20 tickets per report. There are 80 SLA
+    breaches, so the model sees a quarter of them - and the safeguard that
+    states the total for a sampled query result was never applied to anomaly
+    answers at all.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(ANOMALY_TOOL, kind="sla_breach"),
+        text_response("Several urgent tickets have breached their SLA."),
+    )
+
+    result = service.answer("Are urgent tickets breaching the SLA?")
+
+    assert result.answer.startswith(
+        "Unresolved High or Critical tickets older than the agreed SLA window: "
+        "80 flagged."
+    )
+    assert result.truncated is True
+
+
+def test_a_sampled_anomaly_answer_that_states_its_total_is_untouched(
+    service_factory,
+) -> None:
+    """No prefix is added when the answer already gives the total.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    narration = "80 urgent tickets have breached their SLA; the oldest is TKT-233."
+    service, _ = service_factory(
+        tool_response(ANOMALY_TOOL, kind="sla_breach"),
+        text_response(narration),
+    )
+
+    assert service.answer("Any SLA breaches?").answer == narration
+
+
+def test_an_identifier_is_not_mistaken_for_the_total(service_factory) -> None:
+    """Listing TKT-108 does not state that 108 tickets matched.
+
+    The total was checked as a substring, so any answer containing the digits
+    - inside a ticket id, or inside a larger number - counted as stating it,
+    and a partial listing went out unlabelled.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT ticket_id FROM tickets ORDER BY ticket_id LIMIT 108"),
+        text_response("The tickets include TKT-001 and TKT-108."),
+    )
+
+    result = service.answer("List some tickets.")
+
+    assert result.row_count == 108
+    assert result.answer.startswith("108 tickets matched.")
+
+
+def test_no_tickets_inside_a_real_answer_is_not_overruled(service_factory) -> None:
+    """A correct answer that happens to contain "no tickets" is kept.
+
+    The empty-result check matched the phrase anywhere, so "40 are open and no
+    tickets were escalated" - a statement about a result, not a claim that
+    there was none - was replaced by the blunt deterministic summary.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    narration = "40 are open and no tickets were escalated."
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT 40 AS open_count, 0 AS escalated_count"),
+        text_response(narration),
+    )
+
+    assert service.answer("Open and escalated?").answer == narration
+
+
+def test_a_zero_count_may_be_described_as_none(service_factory) -> None:
+    """ "No tickets" is the right answer when the count itself is zero.
+
+    A COUNT returns one row even when nothing matched. That row is not a
+    contradiction of "no tickets were created in 2023" - it is the evidence
+    for it - so the answer must stand.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    narration = "No tickets were created in 2023."
+    service, _ = service_factory(
+        tool_response(
+            QUERY_TOOL,
+            sql="SELECT COUNT(*) AS n FROM tickets WHERE created_at < '2024-01-01'",
+        ),
+        text_response(narration),
+    )
+
+    assert service.answer("How many tickets in 2023?").answer == narration
+
+
+def test_a_blanket_empty_claim_against_real_rows_is_still_overruled(
+    service_factory,
+) -> None:
+    """The safeguard still fires on the case it was built for.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT COUNT(*) AS n FROM tickets WHERE status = 'Open'"),
+        text_response("No tickets matched in 2024."),
+    )
+
+    assert service.answer("How many are open?").answer == "n: 111"
+
+
+def test_fallback_summaries_never_print_none() -> None:
+    """Plain summaries explain an absent value instead of printing "None".
+
+    Shown whenever narration is unavailable, so they are read by people.
+    "avg rating: None" and "(threshold None)" are Python, not answers.
+    """
+    from app.llm import _describe_reports, _describe_rows
+
+    rows_summary = _describe_rows([{"avg_rating": None}])
+    reports_summary = _describe_reports(
+        [
+            {
+                "description": "Tickets whose resolution time is a statistical outlier",
+                "count": 0,
+                "considered": 2,
+                "threshold": None,
+            }
+        ]
+    )
+
+    assert "None" not in rows_summary
+    assert "nothing to aggregate" in rows_summary
+    assert "None" not in reports_summary
+    assert "no threshold" in reports_summary
+
+
+# ---------------------------------------------------------------------------
+# Timeouts and rate-limit messages
+# ---------------------------------------------------------------------------
+
+
+def _timeout_error() -> Exception:
+    """Build the SDK's timeout error.
+
+    Returns:
+        The exception raised when a call exceeds its timeout.
+    """
+    import httpx
+    from groq import APITimeoutError
+
+    return APITimeoutError(request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat"))
+
+
+def test_timeouts_are_not_retried() -> None:
+    """A call that has already waited its full timeout is not repeated.
+
+    The SDK's timeout error subclasses its connection error, which *is*
+    retried - so every timeout was retried twice, tripling a 30-second wait on
+    each of up to four calls, long after the interface had given up.
+    """
+    assert is_retryable(_timeout_error()) is False
+
+
+def test_a_timeout_makes_exactly_one_attempt() -> None:
+    """The retry loop stops at the first timeout and names it plainly."""
+    client = _groq_client_raising(_timeout_error())
+    completions = client._client.chat.completions
+    attempts: list[int] = []
+    original = completions.create
+
+    def counting_create(**kwargs: Any) -> Any:
+        attempts.append(1)
+        return original(**kwargs)
+
+    completions.create = counting_create
+
+    with pytest.raises(LlmUnavailableError, match="did not respond within"):
+        client.complete([{"role": "user", "content": "q"}])
+
+    assert len(attempts) == 1
+
+
+def test_rate_limit_message_does_not_claim_which_limit(real_database: Database) -> None:
+    """The message states the wait, not a guessed per-minute cause.
+
+    The free tier's daily token limit is the one a heavy session exhausts, and
+    it is not reported in headers. "8,000 tokens per minute" sent people back
+    after a minute to fail again.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+    """
+    import httpx
+    from groq import RateLimitError
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat")
+    limited = RateLimitError(
+        "rate limited",
+        response=httpx.Response(429, request=request, headers={"retry-after": "754"}),
+        body=None,
+    )
+    client = _groq_client_raising(limited)
+
+    with pytest.raises(LlmRateLimitedError) as caught:
+        client.complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "per day" in message
+    assert "13 minutes" in message
+    assert caught.value.retry_after == 754
+
+
+# ---------------------------------------------------------------------------
+# The repair attempt
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_repair_reports_the_statement_that_failed(service_factory) -> None:
+    """The SQL shown beside a failure is the one that produced it.
+
+    The first statement validated but failed to run; the repair was rejected
+    by the guard. The response used to show the *first* statement beside the
+    *second* one's error, sending anyone debugging it to the wrong query.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT no_such_column FROM tickets"),
+        tool_response(QUERY_TOOL, sql="DELETE FROM tickets"),
+    )
+
+    result = service.answer("Count the tickets.")
+
+    assert result.tool is None
+    assert result.sql == "DELETE FROM tickets"
+    assert "DELETE" in result.answer
+
+
+def test_a_repair_may_switch_to_the_anomaly_detectors(service_factory) -> None:
+    """A correction that picks the detectors instead of SQL is honoured.
+
+    The repair path read a ``sql`` argument the anomaly tool does not have,
+    and declined an answerable question with "No SQL statement was provided".
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    service, client = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT no_such_column FROM tickets"),
+        tool_response(ANOMALY_TOOL, kind="sla_breach"),
+        text_response("80 urgent tickets have breached their SLA."),
+    )
+
+    result = service.answer("Which urgent tickets are overdue?")
+
+    assert result.tool == ANOMALY_TOOL
+    assert result.row_count == 80
+    # Still bounded: selection, repair, narration.
+    assert len(client.calls) == 3
+
+
+def test_overflowing_month_arithmetic_is_repaired(service_factory) -> None:
+    """Benchmark question 43, end to end: the unsafe query is caught and fixed.
+
+    The model resolved "last month" as ``'-1 month', 'start of month'``,
+    which from 30 March gives 1 March - so the comparison returned March
+    alone. The guard now rejects that order, and its message tells the repair
+    attempt exactly how to correct it.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    unsafe = (
+        "SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS ticket_count "
+        "FROM tickets WHERE created_at >= datetime('2024-03-30 18:06:00', "
+        "'-1 month', 'start of month') GROUP BY month ORDER BY month"
+    )
+    corrected = unsafe.replace("'-1 month', 'start of month'", "'start of month', '-1 month'")
+    service, client = service_factory(
+        tool_response(QUERY_TOOL, sql=unsafe),
+        tool_response(QUERY_TOOL, sql=corrected),
+        text_response("March had 188 tickets against 147 in February."),
+    )
+
+    result = service.answer("How does this month's ticket volume compare with last month's?")
+
+    assert result.rows == [
+        {"month": "2024-02", "ticket_count": 147},
+        {"month": "2024-03", "ticket_count": 188},
+    ]
+    assert result.answer == "March had 188 tickets against 147 in February."
+    repair_request = client.calls[1]["messages"][-1]["content"]
+    assert "'start of month' first" in repair_request
+
+
+# ---------------------------------------------------------------------------
+# DEBUG logging - what LOG_LEVEL=DEBUG promises to show
+# ---------------------------------------------------------------------------
+
+
+def test_debug_log_shows_tool_choice_and_executed_sql(
+    service_factory, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At DEBUG, the model's decision and the SQL actually run are logged.
+
+    The configuration documented DEBUG as showing the generated SQL, but no
+    such log line existed - only rejected SQL was ever logged. The executed
+    form is logged, because validation can change it by appending a LIMIT.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+        caplog: pytest's log capture.
+    """
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="app")
+    service, _ = service_factory(
+        tool_response(QUERY_TOOL, sql="SELECT COUNT(*) AS n FROM tickets WHERE status = 'Open'"),
+        text_response("111 tickets are open."),
+    )
+
+    service.answer("How many are open?")
+
+    assert f"Model chose {QUERY_TOOL}" in caplog.text
+    assert (
+        "Executed SQL (1 rows): SELECT COUNT(*) AS n FROM tickets "
+        "WHERE status = 'Open' LIMIT 500"
+    ) in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Grounding against the evidence the model was actually shown
+# ---------------------------------------------------------------------------
+
+
+def test_the_sample_size_the_model_was_shown_is_grounded(service_factory) -> None:
+    """The answer the narration prompt asks for is not rejected.
+
+    For a result above 20 rows, the evidence opens with "[34 rows matched,
+    showing first 20]" and the prompt asks for "34 tickets matched; the first
+    20 are ...". The grounding check did not count the evidence's own header,
+    so it rejected "20" - the very figure the prompt told the model to write -
+    and replaced the answer with the plain summary. Seen live on benchmark
+    questions 30, 31 and 34.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    narration = "34 tickets matched; the first 20 are TKT-060, TKT-061 and TKT-064."
+    service, _ = service_factory(
+        tool_response(
+            QUERY_TOOL,
+            sql=(
+                "SELECT ticket_id, status, resolution_time_hrs FROM tickets "
+                "WHERE priority = 'Critical' "
+                "AND (resolution_time_hrs > 12 OR resolution_time_hrs IS NULL)"
+            ),
+        ),
+        text_response(narration),
+    )
+
+    result = service.answer("Show me all Critical tickets not resolved within 12 hours.")
+
+    assert result.row_count == 34
+    assert result.answer == narration
+
+
+def test_a_sampled_anomaly_answer_citing_its_sample_is_kept(service_factory) -> None:
+    """The same holds for an anomaly report shown as a sample.
+
+    Args:
+        service_factory: Factory building a service with a scripted client.
+    """
+    narration = "80 tickets matched; the first 20 are TKT-233 and TKT-301 among others."
+    service, _ = service_factory(
+        tool_response(ANOMALY_TOOL, kind="sla_breach"),
+        text_response(narration),
+    )
+
+    assert service.answer("Any SLA breaches?").answer == narration

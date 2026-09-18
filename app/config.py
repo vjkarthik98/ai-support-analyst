@@ -38,7 +38,7 @@ class Settings(BaseSettings):
             normally - see :attr:`llm_enabled`.
         groq_model: Model id to use for tool-calling and narration.
         llm_max_retries: Attempts to retry a transient provider failure. Rate
-            limits are never retried regardless of this value.
+            limits and timeouts are never retried regardless of this value.
         llm_timeout_seconds: Wall-clock limit on a single provider call.
         csv_path: Path to the source ticket data, relative to the repo root.
         as_of: Optional fixed reference "now" for relative-time questions.
@@ -77,13 +77,14 @@ class Settings(BaseSettings):
     groq_model: str = Field(default="openai/gpt-oss-120b")
 
     # How many times a *transient* provider failure is retried - a dropped
-    # connection or a 5xx. Rate limits are deliberately never retried; see
-    # app.llm for why that distinction matters on a per-minute token budget.
+    # connection or a 5xx. Rate limits and timeouts are deliberately never
+    # retried; see app.llm.is_retryable for why.
     llm_max_retries: int = Field(default=2, ge=0, le=5)
 
     # Wall-clock ceiling on one provider call. The SDK's own default allows 60
-    # seconds for a read, which is longer than a user will wait and longer than
-    # the UI's own timeout, so a slow call would fail at the wrong layer.
+    # seconds for a read, longer than a user will wait. A call that times out
+    # is not retried, so this bounds each call; the UI derives its own request
+    # timeout from it, so the two cannot drift apart.
     llm_timeout_seconds: float = Field(default=30.0, gt=0)
 
     # --- Dataset ---------------------------------------------------------
@@ -110,8 +111,10 @@ class Settings(BaseSettings):
 
     # --- Diagnostics -------------------------------------------------------
     # Configurable so someone running this for the first time can raise it to
-    # DEBUG and watch the generated SQL and detector decisions, without having
-    # to edit and re-run the code to find out what it did.
+    # DEBUG and watch the model's tool choice, the SQL it ran and each
+    # detector's decision, without editing code to find out what it did.
+    # Applied to this application's loggers only - see app.main's
+    # configure_logging for why libraries stay at INFO.
     log_level: str = Field(default="INFO")
 
     @field_validator("groq_api_key", mode="before")
@@ -181,6 +184,34 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("as_of")
+    @classmethod
+    def _reject_timezone(cls, value: datetime | None) -> datetime | None:
+        """Refuse an ``AS_OF`` that carries a timezone.
+
+        The dataset's timestamps carry none. Python refuses to compare or
+        subtract a timezone-aware datetime and a naive one, so an ``AS_OF``
+        such as ``2024-03-30T18:06Z`` started cleanly and then failed on the
+        first anomaly check with an error that never mentioned AS_OF.
+        Converting it silently would be worse: there is no way to know which
+        zone the dataset was recorded in.
+
+        Args:
+            value: The parsed timestamp, or ``None`` when not set.
+
+        Returns:
+            ``value`` unchanged when it has no timezone.
+
+        Raises:
+            ValueError: If ``value`` includes a timezone.
+        """
+        if value is not None and value.tzinfo is not None:
+            raise ValueError(
+                "AS_OF must not include a timezone, because the ticket "
+                "timestamps have none. Write it as YYYY-MM-DD HH:MM."
+            )
         return value
 
     @field_validator("log_level")

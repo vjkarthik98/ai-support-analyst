@@ -11,5 +11,59 @@ address = "localhost"
 [browser]
 gatherUsageStats = false
 
+[client]
+# Hides Streamlit's developer toolbar - the "Deploy" button and the rerun,
+# cache and settings menu. They are tools for building the app, not for using
+# it, and read as an unfinished product.
+toolbarMode = "minimal"
+
+# ---------------------------------------------------------------------------
+# Visual identity: a dark slate sidebar beside a clean white workspace, with a
+# single indigo accent. Every value is Streamlit's supported theming, so the
+# look cannot break when Streamlit changes its internal markup - unlike CSS
+# injected against its class names.
+# ---------------------------------------------------------------------------
 [theme]
 base = "light"
+primaryColor = "#4F46E5"            # indigo 600 - the one accent colour
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA" # cards, inputs, code
+textColor = "#0F172A"               # slate 900 - softer than pure black
+borderColor = "#E2E8F0"
+linkColor = "#4F46E5"
+baseRadius = "0.625rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+
+# Inter for interface text, JetBrains Mono for SQL. Loaded from Google Fonts;
+# the fallbacks keep the app readable offline.
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap, monospace"
+baseFontSize = 15
+# A compact scale. Streamlit's defaults (3rem titles) suit a landing page, not
+# a working tool.
+headingFontSizes = ["2rem", "1.375rem", "1.125rem", "1rem", "0.9375rem", "0.875rem"]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+
+dataframeHeaderBackgroundColor = "#F5F7FA"
+chartCategoricalColors = ["#4F46E5", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444"]
+
+[theme.sidebar]
+backgroundColor = "#0F172A"          # slate 900
+secondaryBackgroundColor = "#1E293B" # slate 800 - cards on the dark surface
+textColor = "#E2E8F0"                # slate 200
+borderColor = "#334155"              # slate 700
+primaryColor = "#818CF8"             # indigo 400 - legible on dark
+linkColor = "#A5B4FC"
+# Badges on the dark surface: tinted backgrounds with light text, so each
+# status stays legible without glaring.
+greenBackgroundColor = "#064E3B"
+greenTextColor = "#6EE7B7"
+blueBackgroundColor = "#1E3A8A"
+blueTextColor = "#BFDBFE"
+grayBackgroundColor = "#334155"
+grayTextColor = "#CBD5E1"
+orangeBackgroundColor = "#7C2D12"
+orangeTextColor = "#FDBA74"
+redBackgroundColor = "#7F1D1D"
+redTextColor = "#FCA5A5"

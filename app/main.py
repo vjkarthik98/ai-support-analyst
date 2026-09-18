@@ -51,7 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.anomalies import DETECTORS, detect_anomalies, load_frame
+from app.anomalies import DETECTORS, UnknownDetectorError, detect_anomalies, load_frame
 from app.config import settings
 from app.data import (
     CATEGORIES,
@@ -78,14 +78,34 @@ from app.models import (
     SchemaResponse,
 )
 
-# Configured here because this module is the application entry point. The
-# modules under app/ deliberately do not call basicConfig - a library that
-# configures logging hijacks it from whatever imports it, which is why the
-# convention places this responsibility with the application.
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-)
+def configure_logging(level: str) -> None:
+    """Apply the configured log level to this application's own messages.
+
+    Called here because this module is the application entry point. The
+    modules under app/ deliberately do not configure logging - a library that
+    does hijacks it from whatever imports it, so the convention places this
+    responsibility with the application.
+
+    The level is applied to the ``app`` loggers, not to the root logger.
+    Setting the root to DEBUG would also switch on the debug output of every
+    library in the process - the HTTP client and the Groq SDK among them - and
+    bury the lines DEBUG exists to show: the model's tool choice, the SQL it
+    generated, and each detector's decision. Everything else stays at INFO,
+    exactly as it behaves without DEBUG. This works because a logger's level
+    is checked only where a message originates; records from ``app.*`` still
+    reach the root handler whatever the root's own level.
+
+    Args:
+        level: A validated level name, e.g. ``"INFO"`` or ``"DEBUG"``.
+    """
+    logging.basicConfig(
+        level=logging.INFO if level == "DEBUG" else level,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+    logging.getLogger("app").setLevel(level)
+
+
+configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
 # Column documentation for /schema. Kept beside the endpoint that serves it
@@ -339,6 +359,7 @@ async def health(request: Request) -> HealthResponse:
         status="ok",
         version=__version__,
         dataset_rows=database.row_count,
+        dataset_file=database.source_file,
         as_of=database.as_of.isoformat(sep=" "),
         llm_configured=request.app.state.query_service is not None,
         model=settings.groq_model,
@@ -390,7 +411,7 @@ async def schema(request: Request) -> SchemaResponse:
     summary="Detect anomalous tickets (no language model involved)",
     tags=["analysis"],
 )
-async def anomalies(
+def anomalies(
     request: Request,
     kind: str | None = Query(
         default=None,
@@ -414,6 +435,10 @@ async def anomalies(
     Purely deterministic, with no model involvement, so this endpoint serves
     correctly with no API key configured.
 
+    A plain ``def`` for the same reason as :func:`query`: reading the database
+    and running pandas are blocking work, which belongs in the thread pool
+    rather than on the event loop.
+
     Args:
         request: The incoming request, used to reach application state.
         kind: Optional detector name.
@@ -431,16 +456,17 @@ async def anomalies(
             kinds=[kind] if kind else None,
             window_days=window_days,
         )
-    except KeyError as exc:
+    except UnknownDetectorError as exc:
         # The detector name came from the caller, so an unknown one is a client
         # error. The message names the valid options rather than only refusing.
         #
-        # exc.args[0] rather than str(exc): KeyError's str() wraps the message
-        # in repr quotes, which would surface to the caller as "'Unknown
-        # detector...'" complete with stray apostrophes.
+        # Caught by its own type, never as a bare KeyError: that would also
+        # catch a KeyError raised by a bug inside a detector and misreport a
+        # server fault as the caller's mistake. Anything else falls through to
+        # the 500 handler, which is what it is.
         return _error(
             "unknown_detector",
-            str(exc.args[0]) if exc.args else "Unknown anomaly detector.",
+            str(exc),
             status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
     except sqlite3.Error as exc:
@@ -475,13 +501,20 @@ async def anomalies(
         503: {"model": ErrorResponse, "description": "No API key configured"},
     },
 )
-async def query(request: Request, body: QueryRequest) -> QueryResponse:
+def query(request: Request, body: QueryRequest) -> QueryResponse:
     """Answer a natural-language question about the tickets.
 
     The question is translated into a tool call, the result is computed here,
     and a model phrases the answer. The SQL and the full result set are
     returned alongside the prose so the answer can be verified rather than
     trusted.
+
+    Declared with plain ``def``, not ``async def``, and that is load-bearing.
+    The pipeline makes blocking network calls and sleeps between retries.
+    Inside ``async def`` that work runs on the event loop itself, freezing
+    every other request - ``/health`` included - until the model answers.
+    FastAPI runs a plain ``def`` endpoint in its worker thread pool, so a slow
+    question blocks only its own request.
 
     Args:
         request: The incoming request, used to reach application state.

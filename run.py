@@ -243,6 +243,33 @@ def stop(process: subprocess.Popen[bytes] | None, name: str) -> None:
         process.wait()
 
 
+def wait_for_first_exit(
+    processes: dict[str, subprocess.Popen[bytes]],
+    *,
+    poll_interval: float = POLL_INTERVAL_SECONDS,
+) -> str:
+    """Block until any one of the given processes exits.
+
+    Both services are watched, not only the one a user closes. Waiting on the
+    UI alone meant an API that crashed mid-session went unreported: the
+    interface kept running, every question failed with "cannot reach the
+    API", and the terminal - the one place the cause was visible - said
+    nothing had happened.
+
+    Args:
+        processes: Running processes, keyed by the name to report.
+        poll_interval: Seconds between checks.
+
+    Returns:
+        The name of the first process found to have exited.
+    """
+    while True:
+        for name, process in processes.items():
+            if process.poll() is not None:
+                return name
+        time.sleep(poll_interval)
+
+
 def main() -> int:
     """Start both services and run until interrupted.
 
@@ -284,10 +311,16 @@ def main() -> int:
 
         print("\n  Both services running. Press Ctrl+C to stop.\n")
 
-        # Wait on the UI: it is the process a user closes to end the session.
-        # If it exits on its own, the API is torn down with it rather than left
-        # running invisibly.
-        ui.wait()
+        # Either exiting ends the session: the UI is useless without the API,
+        # and an API left running without its UI would be invisible.
+        exited = wait_for_first_exit({"API": api, "UI": ui})
+        process = api if exited == "API" else ui
+        print(
+            f"\n  The {exited} stopped unexpectedly (exit code "
+            f"{process.returncode}). Its error output is above. Stopping.",
+            file=sys.stderr,
+        )
+        return 1
 
     except KeyboardInterrupt:
         print("\n  Stopping...")

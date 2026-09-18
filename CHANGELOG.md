@@ -5,6 +5,205 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-09-18
+
+A full code review, every benchmark failure traced to its root cause, and a
+100% automatic pass rate on the live benchmark.
+
+### Added
+
+- DEBUG logging that shows what the documentation promised it would: the
+  model's tool choice and arguments, the SQL as actually executed (after
+  validation added its LIMIT), and each anomaly detector's decision. The level
+  applies to this application's loggers only; every library stays at INFO, so
+  their own debug output does not bury these lines.
+- A `dataset_file` field on `/health`: the name of the CSV the tickets were
+  loaded from, recorded at ingestion so it always matches the data actually
+  read. The name only - a full path would reveal the machine's folder layout
+  to any caller.
+- A `tokens_estimated` field on `/query` responses. The provider reports no
+  usage for a request it rejects - a model declining to call a tool, for
+  instance - although the tokens were spent. Those calls are now estimated from
+  the text length rather than recorded as zero, and flagged. The UI shows such
+  counts with a `~`.
+- A guard against month arithmetic that overflows. `datetime(anchor, '-1
+  month', 'start of month')` from 30 March is "30 February", which SQLite
+  normalises to 1 March, so "last month" silently became this month. The
+  unsafe order is rejected with a message giving the correct one, and the
+  prompt now teaches `'start of month', '-1 month'`.
+- `ui/formatting.py`, holding the interface's text handling where it can be
+  unit-tested; the Streamlit page runs when imported, so nothing inside it can
+  be.
+- A redesigned interface. A dark slate sidebar and a single indigo accent
+  replace Streamlit's defaults, set entirely through its supported theme
+  settings - no CSS aimed at internal markup, which breaks on upgrade. The
+  developer toolbar and "Deploy" button are hidden. The sidebar reads at a
+  glance: status badges, a card for the ticket count naming the file it was
+  loaded from, and the reference date, written "30 Mar 2024" so it reads the
+  same in every convention. An
+  answer sits in a card with a one-line summary of how it was produced,
+  rather than four oversized metrics that outweighed it - "query_tickets" had
+  been the largest text on the page. Ticket ids no longer break across lines
+  at the hyphen, missing values show as "—" rather than "None", suggested
+  questions are chips, and each anomaly detector has its own card with its
+  threshold, severity chart and flagged tickets. Every state - answered,
+  anomaly dashboard, no API key, API offline - was reviewed from real
+  screenshots, which caught two defects that tests had passed: "None" still
+  shown in tables, and status badges wrapping.
+- A README rewritten for evaluators: architecture, design decisions, setup,
+  configuration, real example outputs, honest limitations, and twelve
+  screenshots of the UI, the API and a benchmark run.
+- `.env.example` and `.env` rewritten from one template, identical apart from
+  the key, documenting all fourteen settings. Four - `LLM_TIMEOUT_SECONDS`,
+  `LLM_MAX_RETRIES`, `QUERY_TIMEOUT_SECONDS` and `LOG_LEVEL` - were supported by
+  the code but documented nowhere.
+- 85 tests, taking the suite from 296 to 381. Each fix below was made
+  test-first: a test reproducing the defect, confirmed to fail on the old code
+  before the fix was written.
+
+### Fixed
+
+Found by the live benchmark. Each passed the unit tests, because each concerns
+how the model behaves rather than how the code executes.
+
+- "Were more tickets raised in March than in January?" was answered "March had
+  no recorded tickets". The prompt taught relative dates but not named months,
+  so the model guessed, and SQLite fails silently on both obvious guesses:
+  `strftime('%m', ...) = '3'` matches nothing because months are zero-padded,
+  and `'%B'` month names return NULL.
+- "How does this month's ticket volume compare with last month's?" returned
+  March alone - the month-arithmetic overflow described above.
+- Numbers written as words escaped the grounding check entirely. It recognised
+  only digits, so a fabricated "twenty-one tickets" would have passed
+  unverified. Number words up to ninety-nine are now checked like digits, and
+  the prompt asks for digits even at the start of a sentence, where English
+  style prefers a word ("Six tickets...").
+- A model's refusal was shown to the user verbatim. Asked "why use the IQR
+  rather than a standard deviation?", the model declined the tools and wrote a
+  five-section essay from general knowledge, which reached the user
+  unverified. The comment beside that code said the prose would *not* be
+  passed through; the code did the opposite. A decline now always shows the
+  fixed refusal message.
+- An answer claimed "an inverse relationship" between response time and
+  rating from averages of 3.86, 3.76 and 3.67; the true correlation is -0.078.
+  The narration prompt now says to state figures, not trends or causes.
+- An average over no values was reported as "NULL". The prompt now asks for
+  the reason instead: unresolved tickets carry no rating.
+- Three correct answers were replaced by the plain summary in the final
+  benchmark run. The narration prompt asks for "34 tickets matched; the first
+  20 are ...", but the grounding check did not count the evidence's own header
+  ("[34 rows matched, showing first 20]") and rejected the "20". Any figure in
+  the evidence the model read now counts as grounded. The run's log showed the
+  same warning for all three questions, and each was confirmed live in the UI
+  after the fix.
+
+Found by a full code review of every module.
+
+- A slow question froze the whole API. `/query` was declared `async def` but
+  made blocking network calls and slept between retries, so `/health` and
+  every other request waited until the model answered. `/query` and
+  `/anomalies` now run in FastAPI's worker thread pool.
+- Invented counts passed the grounding check. It accepted any number from 0 to
+  100 that equalled the ratio of *any* two grounded values, whether or not the
+  answer presented it as a percentage; with a few dozen values almost every
+  such number qualifies. An invented 55 passed against a real twelve-row
+  per-agent result. The allowance now applies only to figures written as
+  percentages.
+- Anomaly answers never stated how many tickets were flagged. The narration
+  shows at most 20 tickets per report, and the safeguard that states the total
+  for a sampled result applied only to SQL answers - so 80 SLA breaches could
+  be described from 20 of them. Each sampled report's total is now required.
+- The CSV text "nan" and "inf" passed validation, because Python's `float()`
+  accepts both. A NaN failed later with an error naming neither ticket nor
+  value; an infinity turned every average into `inf`.
+- Timeouts were retried. The SDK's timeout error is a kind of connection
+  error, which is retried, so each 30-second timeout could become 90 seconds,
+  on each of up to four calls per question - long after the interface had
+  given up at 60 seconds, while the server kept spending tokens. Timeouts are
+  no longer retried, and the interface's own timeout is derived from the
+  provider's, so the two cannot drift apart.
+- The check for a stated total compared substrings, so a total of 34 counted
+  as "stated" in any answer containing "TKT-340". Figures are now compared
+  whole, with ticket and agent ids excluded.
+- Plain summaries printed Python's `None`: "avg rating: None", "(threshold
+  None)". They now say why there is no value.
+- The rate-limit message always blamed the per-minute limit, although the
+  daily limit is the one a heavy session exhausts. It now states the wait the
+  provider asked for, and mentions both limits.
+- A bug inside an anomaly detector was reported as the caller's mistake.
+  `/anomalies` caught every `KeyError` as "unknown detector" (HTTP 422), and the
+  query pipeline caught `KeyError`, `ValueError` and `TypeError` as "bad
+  arguments". A dedicated `UnknownDetectorError` is caught instead, the model's
+  arguments are validated before anything runs, and a genuine fault now
+  surfaces as a 500.
+- The interface discarded the actual error and showed "The API is not
+  reachable" for every failure, including an API that answered with an error
+  or was merely slow.
+- A correct answer containing "no tickets" was replaced by the plain summary.
+  The empty-result check matched the phrase anywhere, so "40 are open and no
+  tickets were escalated" was overruled. Only a blanket claim of emptiness
+  that states no figure is now treated as one, and a count of zero may be
+  described as "no tickets".
+- Tickets raised after a pinned `AS_OF` leaked into every result: counted by
+  SQL, judged by the detectors, and given a negative age by the SLA rule. They
+  are now excluded when the database is built, and time windows end at
+  `AS_OF`.
+- After a failed repair, the response showed the SQL from the wrong attempt,
+  and a repair that switched to the anomaly tool was declined with "No SQL
+  statement was provided". The failing statement is now reported, and the
+  switch is honoured.
+- The string function `REPLACE()` was rejected along with the `REPLACE INTO`
+  statement that shares its name. The two are now told apart.
+- Model-written answers were rendered as Markdown, so a pair of dollar signs
+  became a formula and underscores became emphasis. They are now escaped.
+- The launcher watched only the interface. An API that crashed mid-session
+  left the UI failing every question while the terminal reported nothing. Both
+  processes are now watched.
+- Each outlier's reason contradicted its own row. It read "above the 48.1h
+  outlier threshold (Q3 22.9h ...)" beside a threshold column of 48.15:
+  formatted to one decimal, 48.15 prints as 48.1 because it is stored as
+  48.1499.... The fence, Q3 and IQR are now stated to two decimals - "48.15h
+  (Q3 22.95h + 1.5 x IQR 16.80h)" - matching the report and the benchmark.
+  Caught from a screenshot of the redesigned interface, where the two numbers
+  sat side by side.
+- A timezone-aware `AS_OF` started cleanly and then failed on the first
+  anomaly check with an error that never mentioned the setting. It is now
+  rejected at startup, naming `AS_OF`.
+- Comments claimed DEBUG showed the generated SQL, although no such log line
+  existed; others described retry and timeout behaviour that had changed. All
+  now match the code.
+
+### Decided
+
+- Recorded the final benchmark result: 41 passed, 0 failed, 9 needing review -
+  a 100% automatic pass rate, up from 95% and then 98% in the two earlier runs
+  the same day. The run predates the grounding fix above, so three of its
+  answers are plain summaries; `docs/BENCHMARK_RESULTS.md` records the run as
+  it happened rather than being edited afterwards. The benchmark questions
+  were also used to find these bugs, so the system has in effect been tuned
+  against them - stated in the README rather than left implicit.
+- Left the benchmark grader strict. Accepting "Six" in place of "6" would have
+  passed a question while hiding the grounding gap behind it.
+- Did not add an automatic fallback model for rate limits. The evaluator uses
+  their own key, and a walkthrough stays well inside the free tier. A fallback
+  model would answer with prompts and guards never benchmarked on it: a
+  possibly wrong answer is worse than a clear "wait 20 seconds". The
+  `ChatClient` protocol leaves room for one as a wrapper, without changing the
+  pipeline.
+- Kept ingestion at startup, with no file upload. The brief supplies one fixed
+  dataset, and the guard, prompts and detectors are all tied to its schema;
+  upload would add failure modes without meeting a requirement.
+- Kept both prompts inside their token ceilings by tightening wording rather
+  than raising the limits, as the budget tests instruct. The system prompt
+  reached 936 of 900 tokens, and the narration prompt exactly 340 of 340,
+  before being trimmed.
+- Tested safeguards against the prompts that feed them, since the "20"
+  rejections came from exactly such a mismatch: the narration prompt asked for
+  a figure the grounding check refused. One test confirms that every date
+  example in the system prompt passes the SQL guard; another that the answer
+  shape the narration prompt requests passes the grounding check.
+
+
 ## [0.7.0] - 2026-09-17
 
 Answer verification, retry policy, and a fifty-question benchmark.

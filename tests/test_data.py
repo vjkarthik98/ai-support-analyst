@@ -64,6 +64,28 @@ def test_as_of_anchors_to_the_latest_ticket(real_database: Database) -> None:
     assert real_database.as_of == datetime(2024, 3, 30, 18, 6)
 
 
+def test_database_records_the_file_it_was_built_from(
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """The source file's name is taken from the CSV actually read.
+
+    Recorded at ingestion rather than read back from configuration, so the
+    name reported can never disagree with the data that was loaded.
+
+    Args:
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row())
+
+    database = build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+    assert database.source_file == csv_path.name
+
+
 def test_unresolved_ticket_count(real_database: Database) -> None:
     """Open and Escalated tickets together total 173.
 
@@ -307,6 +329,52 @@ def test_configured_as_of_overrides_the_dataset_anchor(
     database = build_database(csv_path=project_csv, db_path=tmp_path / "tickets.db")
 
     assert database.as_of == pinned
+
+
+def test_tickets_after_a_pinned_as_of_are_excluded(
+    project_csv: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned AS_OF removes tickets that did not yet exist at that moment.
+
+    They previously stayed in the table: counted by SQL, judged by the anomaly
+    detectors, and given a negative age by the SLA rule.
+
+    Args:
+        project_csv: Path to the shipped dataset.
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's attribute patcher.
+    """
+    pinned = datetime(2024, 2, 1, 12, 0)
+    monkeypatch.setattr(settings, "as_of", pinned)
+
+    database = build_database(csv_path=project_csv, db_path=tmp_path / "tickets.db")
+
+    with read_only_connection(database.path) as connection:
+        latest, count = connection.execute(
+            "SELECT MAX(created_at), COUNT(*) FROM tickets"
+        ).fetchone()
+    assert latest <= "2024-02-01 12:00:00"
+    assert 0 < database.row_count < 500
+    # The reported row count describes the table actually built.
+    assert count == database.row_count
+
+
+def test_as_of_before_every_ticket_is_rejected(
+    project_csv: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An AS_OF preceding the whole dataset fails loudly, not as an empty table.
+
+    An empty table would answer every question with a confident zero.
+
+    Args:
+        project_csv: Path to the shipped dataset.
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's attribute patcher.
+    """
+    monkeypatch.setattr(settings, "as_of", datetime(2020, 1, 1))
+
+    with pytest.raises(DataIntegrityError, match="earlier than every ticket"):
+        build_database(csv_path=project_csv, db_path=tmp_path / "tickets.db")
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +795,40 @@ def test_negative_durations_are_rejected(
     csv_path = write_csv(valid_row(**overrides))
 
     with pytest.raises(DataIntegrityError, match="cannot be negative"):
+        build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"response_time_hrs": "nan"}, id="NaN response time"),
+        pytest.param({"resolution_time_hrs": "NaN"}, id="NaN resolution time"),
+        pytest.param({"response_time_hrs": "inf"}, id="infinite response time"),
+        pytest.param({"resolution_time_hrs": "-inf"}, id="negative infinity"),
+    ],
+)
+def test_non_finite_durations_are_rejected(
+    overrides: dict[str, str],
+    write_csv: Callable[..., Path],
+    valid_row: Callable[..., str],
+    tmp_path: Path,
+) -> None:
+    """The text "nan" and "inf" is refused, although ``float()`` accepts it.
+
+    Stored, a NaN becomes NULL - breaking the NOT NULL constraint with an
+    error that names neither ticket nor value - and an infinity turns every
+    average over its column into ``inf``. Both are caught here instead, with
+    the ticket named.
+
+    Args:
+        overrides: The field to corrupt.
+        write_csv: Factory writing a temporary CSV.
+        valid_row: Factory producing a valid row.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    csv_path = write_csv(valid_row(**overrides))
+
+    with pytest.raises(DataIntegrityError, match="must be a finite number"):
         build_database(csv_path=csv_path, db_path=tmp_path / "tickets.db")
 
 

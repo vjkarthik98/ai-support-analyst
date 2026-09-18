@@ -73,6 +73,13 @@ ALLOWED_STATEMENTS: list[tuple[str, str]] = [
     ("inert trailing line comment", "SELECT 1 --; DROP TABLE tickets"),
     ("semicolon then comment", "SELECT 1; -- DROP TABLE tickets"),
     ("inert block comment", "SELECT /* a note */ COUNT(*) FROM tickets"),
+    # REPLACE() the string function only reads. The keyword list used to
+    # reject it along with the REPLACE statement that shares its name.
+    (
+        "replace string function",
+        "SELECT REPLACE(issue_summary, ' ', '_') AS slug FROM tickets",
+    ),
+    ("replace function with space before bracket", "SELECT replace (agent_id, 'AGT-', '') FROM tickets"),
 ]
 
 # --------------------------------------------------------------------------
@@ -99,6 +106,12 @@ REJECTED_STATEMENTS: list[tuple[str, str]] = [
     # A valid-looking CTE whose terminal statement is destructive. This is why
     # the keyword scan covers the whole statement, not just its first word.
     ("cte leading to delete", "WITH t AS (SELECT 1) DELETE FROM tickets"),
+    # The REPLACE statement is still refused, including behind a CTE, where
+    # the leading-keyword check cannot see it.
+    (
+        "cte leading to replace",
+        "WITH t AS (SELECT 1) REPLACE INTO tickets (ticket_id) VALUES ('x')",
+    ),
     # load_extension is a function, not a statement keyword, so a keyword-only
     # scan would miss it - and it can load arbitrary native code.
     ("load_extension", "SELECT load_extension('evil.so')"),
@@ -291,5 +304,71 @@ def test_anchored_and_literal_queries_are_allowed(sql: str) -> None:
 
     Args:
         sql: A statement that must be accepted.
+    """
+    assert validate_select(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            # The exact statement the benchmark caught, for question 43.
+            "SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS ticket_count "
+            "FROM tickets WHERE created_at >= datetime('2024-03-30 18:06:00', 'start of month') "
+            "OR created_at >= datetime('2024-03-30 18:06:00', '-1 month', 'start of month') "
+            "GROUP BY month",
+            id="benchmark question 43",
+        ),
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets WHERE created_at >= date('2024-03-30', '-2 months', 'start of month')",
+            id="plural months",
+        ),
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets WHERE created_at >= DATETIME('2024-03-30', ' -1 MONTH ', 'Start Of Month')",
+            id="odd spacing and case",
+        ),
+    ],
+)
+def test_month_offset_before_start_of_month_is_rejected(sql: str) -> None:
+    """A month offset applied before 'start of month' is refused.
+
+    SQLite applies modifiers in order. 30 March minus one month is "30
+    February", normalised to 1 March, so 'start of month' then gives 1 March:
+    "last month" silently becomes this month. The query runs cleanly and the
+    answer is wrong - asked to compare March with February, it returned March
+    alone. The message gives the corrected order for the repair attempt.
+
+    Args:
+        sql: A statement using the unsafe modifier order.
+    """
+    with pytest.raises(SqlGuardError, match="'start of month' first"):
+        validate_select(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets WHERE created_at >= "
+            "datetime('2024-03-30 18:06:00', 'start of month', '-1 month')",
+            id="start of month first",
+        ),
+        pytest.param(
+            "SELECT COUNT(*) FROM tickets WHERE created_at >= "
+            "datetime('2024-03-30 18:06:00', '-1 month') "
+            "AND created_at < datetime('2024-03-30 18:06:00', 'start of month')",
+            id="offset and start of month in separate calls",
+        ),
+        pytest.param(
+            "SELECT * FROM tickets WHERE issue_summary LIKE '%start of month%'",
+            id="the phrase inside a text search",
+        ),
+    ],
+)
+def test_safe_month_arithmetic_is_allowed(sql: str) -> None:
+    """The correct order, and unrelated uses of the words, are unaffected.
+
+    Args:
+        sql: A legitimate statement.
     """
     assert validate_select(sql)

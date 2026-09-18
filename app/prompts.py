@@ -67,6 +67,10 @@ def build_system_prompt(as_of: datetime, row_count: int) -> str:
     priorities = " | ".join(sorted(PRIORITIES))
     statuses = " | ".join(sorted(STATUSES))
     anchor = as_of.strftime("%Y-%m-%d %H:%M:%S")
+    # Named months ("in March") carry no year. The dataset's own year is the
+    # only sensible default, and deriving it from the anchor keeps the prompt
+    # correct if an operator pins AS_OF to a different point in time.
+    year = as_of.strftime("%Y")
 
     return f"""\
 You are a data analyst for a customer support team. You answer questions about \
@@ -91,7 +95,11 @@ against the timestamp above - never against today's real date. Use SQLite date
 arithmetic on that value, for example:
   this week   -> created_at >= datetime('{anchor}', '-7 days')
   this month  -> created_at >= datetime('{anchor}', 'start of month')
+  last month  -> datetime('{anchor}', 'start of month', '-1 month')
   last 24h    -> created_at >= datetime('{anchor}', '-24 hours')
+  in February -> strftime('%Y-%m', created_at) = '{year}-02'
+Months are zero-padded and '%B' names return NULL. Compare months by GROUP BY
+on strftime('%Y-%m', created_at). Unstated years mean {year}.
 
 MEANING OF THE DATA
 - "Unresolved" or "still open" means status IN ('Open', 'Escalated').
@@ -256,14 +264,17 @@ def build_narration_messages(
         "that date.\n\n"
         "Rules:\n"
         "- Use only the figures given. Never estimate or invent.\n"
-        "- Quote numbers exactly, rounding long decimals to two places but "
-        "leaving whole numbers whole: 111 tickets, not 111.00.\n"
+        "- Quote numbers exactly, in digits even to open a sentence ('6 "
+        "tickets', never 'Six'), rounding long decimals to two places but "
+        "leaving whole numbers whole: 111, not 111.00.\n"
+        "- State the figures, not trends or causes: small differences between "
+        "groups are not a relationship.\n"
         "- The bracketed first line is metadata: never repeat it, always "
         "believe it. Any number above 0 means tickets DID match, however the "
         "column values look.\n"
-        "- NULL means not applicable - a ticket never resolved. That still "
-        "matches a question about tickets not resolved in time, and a column "
-        "of NULLs is a real result, not missing data.\n"
+        "- NULL means never resolved: it still matches 'not resolved in "
+        "time', and is a real result, not missing data. A NULL average means "
+        "there was nothing to average: say that, and why.\n"
         "- Rows are in rank order. Equal whole numbers are a genuine tie, so "
         "name them all; equal rounded decimals may differ beyond the digits "
         "shown, so lead with the first and say the next is close behind.\n"

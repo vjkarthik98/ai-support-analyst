@@ -161,12 +161,64 @@ def test_one_invented_figure_among_correct_ones_is_flagged() -> None:
     assert check("111 are open and 87 are escalated.", [{"n": 111}]) == ["87"]
 
 
+def test_invented_count_that_happens_to_be_a_ratio_is_flagged() -> None:
+    """The percentage allowance applies only to figures written as percentages.
+
+    22 / 40 = 55%, so a percentage of 55 is derivable from this evidence. A
+    *count* of 55 is not - nothing here is 55 of anything. The allowance was
+    once applied to every number, and with a few dozen grounded values nearly
+    every figure from 0 to 100 is some ratio of two of them: an invented 55
+    passed against a real twelve-row, per-agent result.
+    """
+    rows = [{"n": 40}, {"n": 22}, {"n": 110}]
+
+    assert check("The busiest agent handled 55 tickets.", rows) == ["55"]
+    # The same figure presented as the percentage it is remains legitimate.
+    assert check("55% of them were escalated.", rows) == []
+    assert check("55 percent of them were escalated.", rows) == []
+
+
+def test_invented_figure_spelled_in_words_is_flagged() -> None:
+    """A fabricated figure cannot escape the check by being written as words.
+
+    The live model opened an answer with "Six tickets" rather than "6
+    tickets". Six is small enough to be exempt, but the same habit applied
+    to a larger figure would have put an unverified number in front of the
+    user, because only digits were being checked.
+    """
+    assert check("Twenty-one tickets breached the SLA.", [{"n": 80}]) == ["21"]
+
+
+# ---------------------------------------------------------------------------
+# Number words - verified like digits, without flagging ordinary prose
+# ---------------------------------------------------------------------------
+
+
+def test_correct_figure_spelled_in_words_is_grounded() -> None:
+    """A true figure written as words is accepted, not merely ignored."""
+    assert check("Eighty tickets breached the SLA.", [{"n": 80}]) == []
+
+
+def test_number_words_inside_other_words_are_not_numbers() -> None:
+    """Only whole words are read as numbers.
+
+    "someone", "often" and "none" contain "one" and "ten"; reading them as
+    figures would flag ordinary prose and discard good answers.
+    """
+    assert check("Someone often reports none of these; 111 remain.", [{"n": 111}]) == []
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
         pytest.param("1,234 tickets", ["1234"], id="thousands separator"),
         pytest.param("3.74 average", ["3.74"], id="decimal"),
         pytest.param("no numbers here", [], id="none"),
+        pytest.param("Six tickets", ["6"], id="word opening a sentence"),
+        pytest.param("twenty-one and forty two", ["21", "42"], id="compound words"),
+        pytest.param("seventy tickets", ["70"], id="tens word"),
+        pytest.param("15 and fifteen", ["15", "15"], id="digits and words in order"),
+        pytest.param("someone often has none", [], id="words inside words"),
     ],
 )
 def test_number_extraction(text: str, expected: list[str]) -> None:

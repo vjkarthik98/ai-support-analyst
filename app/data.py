@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -114,11 +115,15 @@ class Database:
             operator-configured value, or the dataset's own latest
             ``created_at`` when none was configured.
         row_count: Number of ticket rows loaded.
+        source_file: Name of the CSV the rows were loaded from - the name
+            only, never the full path, so reporting it does not reveal the
+            machine's folder layout.
     """
 
     path: Path
     as_of: datetime
     row_count: int
+    source_file: str
 
 
 class DataIntegrityError(ValueError):
@@ -152,13 +157,20 @@ def _parse_created_at(raw: str, *, ticket_id: str) -> datetime:
         ) from exc
 
 
-def _reject_negative(value: float, *, field: str, ticket_id: str) -> float:
-    """Confirm a duration is not negative.
+def _validate_duration(value: float, *, field: str, ticket_id: str) -> float:
+    """Confirm a duration is a finite, non-negative number of hours.
 
     Both time columns measure elapsed hours, so a negative value is not merely
     unusual - it is impossible. Accepting one would silently distort every
     statistic computed over the column, and would drag the interquartile fence
     downwards so that genuinely slow tickets stopped being flagged.
+
+    Non-finite values are rejected for the same reason, and are easy to miss:
+    Python's ``float()`` accepts the text "nan" and "inf". A NaN is exactly
+    what this module promises never to store - SQLite turns it into NULL, which
+    then violates the column's NOT NULL constraint with an error naming neither
+    the ticket nor the value. An infinity is stored as-is and turns every
+    average over the column into ``inf``.
 
     Args:
         value: The parsed duration.
@@ -169,8 +181,13 @@ def _reject_negative(value: float, *, field: str, ticket_id: str) -> float:
         ``value``, unchanged, when it is valid.
 
     Raises:
-        DataIntegrityError: If ``value`` is negative.
+        DataIntegrityError: If ``value`` is NaN, infinite or negative.
     """
+    if not math.isfinite(value):
+        raise DataIntegrityError(
+            f"{ticket_id}: {field} is {value}, but a duration must be a finite "
+            "number of hours"
+        )
     if value < 0:
         raise DataIntegrityError(
             f"{ticket_id}: {field} is {value}, but a duration cannot be negative"
@@ -201,7 +218,7 @@ def _parse_required_float(raw: str, *, field: str, ticket_id: str) -> float:
         raise DataIntegrityError(
             f"{ticket_id}: {field} {raw!r} is not numeric"
         ) from exc
-    return _reject_negative(value, field=field, ticket_id=ticket_id)
+    return _validate_duration(value, field=field, ticket_id=ticket_id)
 
 
 def _parse_optional_float(raw: str, *, field: str, ticket_id: str) -> float | None:
@@ -230,7 +247,7 @@ def _parse_optional_float(raw: str, *, field: str, ticket_id: str) -> float | No
         raise DataIntegrityError(
             f"{ticket_id}: {field} {raw!r} is not numeric"
         ) from exc
-    return _reject_negative(value, field=field, ticket_id=ticket_id)
+    return _validate_duration(value, field=field, ticket_id=ticket_id)
 
 
 def _parse_optional_int(raw: str, *, field: str, ticket_id: str) -> int | None:
@@ -453,6 +470,53 @@ def _load_rows(csv_path: Path) -> tuple[list[tuple], datetime]:
     return rows, latest_created_at
 
 
+def _exclude_after(rows: list[tuple], as_of: datetime) -> list[tuple]:
+    """Drop tickets raised after a pinned ``AS_OF``.
+
+    Pinning ``AS_OF`` means "answer as of this moment", so a ticket raised
+    later did not yet exist. Left in, it leaked into every result: counted by
+    SQL, judged by the anomaly detectors, and given a negative age by the SLA
+    rule. Removing it at ingestion keeps SQL and the detectors consistent,
+    because both read the same table.
+
+    One limit is inherent to the data rather than to this code: the CSV holds
+    each ticket's *final* status, so a ticket raised before ``AS_OF`` but
+    resolved after it still appears resolved. The history needed to rewind a
+    status does not exist in the file.
+
+    Args:
+        rows: Coerced rows in :data:`COLUMNS` order.
+        as_of: The pinned reference time.
+
+    Returns:
+        The rows raised at or before ``as_of``.
+
+    Raises:
+        DataIntegrityError: If ``as_of`` precedes every ticket, which would
+            leave an empty table that answers every question with zero.
+    """
+    # created_at is stored as sortable ISO text, so a string comparison is an
+    # exact chronological one.
+    cutoff = as_of.strftime("%Y-%m-%d %H:%M:%S")
+    created_at_index = COLUMNS.index("created_at")
+    kept = [row for row in rows if row[created_at_index] <= cutoff]
+
+    if not kept:
+        raise DataIntegrityError(
+            f"AS_OF {as_of:%Y-%m-%d %H:%M} is earlier than every ticket in the "
+            "dataset. Leave AS_OF blank to anchor on the latest ticket."
+        )
+
+    excluded = len(rows) - len(kept)
+    if excluded:
+        logger.info(
+            "Excluded %d ticket(s) raised after the pinned AS_OF %s",
+            excluded,
+            cutoff,
+        )
+    return kept
+
+
 def build_database(
     csv_path: Path | None = None, db_path: Path | None = None
 ) -> Database:
@@ -496,6 +560,11 @@ def build_database(
 
     rows, latest_created_at = _load_rows(csv_path)
 
+    as_of = settings.as_of or latest_created_at
+
+    if settings.as_of is not None:
+        rows = _exclude_after(rows, as_of)
+
     connection = sqlite3.connect(str(db_path))
     try:
         connection.execute(_CREATE_TABLE_SQL)
@@ -503,8 +572,6 @@ def build_database(
         connection.commit()
     finally:
         connection.close()
-
-    as_of = settings.as_of or latest_created_at
 
     logger.info(
         "Built %s: %d rows, as_of=%s%s",
@@ -514,7 +581,9 @@ def build_database(
         " (configured)" if settings.as_of else " (auto-anchored)",
     )
 
-    return Database(path=db_path, as_of=as_of, row_count=len(rows))
+    return Database(
+        path=db_path, as_of=as_of, row_count=len(rows), source_file=csv_path.name
+    )
 
 
 class QueryTimeoutError(Exception):

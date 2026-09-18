@@ -26,21 +26,42 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-# Read from the environment first so the UI can point at a different host,
-# falling back to the same configuration the API itself uses - rather than
-# hard-coding a port in two places that could drift.
+# A sibling module: Streamlit puts this script's own folder on sys.path, so it
+# imports the same way however the app is launched.
+from formatting import (
+    answer_metadata,
+    blank_missing,
+    detector_label,
+    escape_markdown,
+    format_reference_date,
+    keep_identifiers_together,
+)
+
+# A question makes at most four model calls (see app.llm), each bounded by the
+# provider timeout and never retried after timing out. The interface must wait
+# longer than that worst case. It once gave up at 60 seconds while the server
+# could legitimately take minutes - telling the user the request had failed
+# while the server carried on, still spending tokens on an answer no one saw.
+_MAX_MODEL_CALLS = 4
+# Headroom for the database query (itself capped at a few seconds), transport
+# retries, and HTTP overhead.
+_TIMEOUT_HEADROOM_SECONDS = 30.0
+
 try:
     from app.config import settings
 
     _DEFAULT_API = f"http://{settings.api_host}:{settings.api_port}"
+    _LLM_TIMEOUT = settings.llm_timeout_seconds
 except Exception:  # pragma: no cover - the UI must run even if config fails
     _DEFAULT_API = "http://127.0.0.1:8000"
+    _LLM_TIMEOUT = 30.0
 
+# Read from the environment first so the UI can point at a different host,
+# falling back to the same configuration the API itself uses - rather than
+# hard-coding a port in two places that could drift.
 API_BASE_URL = os.getenv("API_BASE_URL", _DEFAULT_API).rstrip("/")
 
-# Generous relative to a typical request: a question costs two sequential model
-# calls, and a cold first call can be slow.
-REQUEST_TIMEOUT = 60.0
+REQUEST_TIMEOUT = _MAX_MODEL_CALLS * _LLM_TIMEOUT + _TIMEOUT_HEADROOM_SECONDS
 
 # Drawn from the brief's own sample questions, so a reviewer can exercise the
 # system without inventing queries. Ordered shortest to longest: laid out two
@@ -58,12 +79,14 @@ SAMPLE_QUESTIONS = [
     "What is the average customer rating for Technical category tickets?",
 ]
 
-# Two columns rather than three. In a wide layout each column is broad enough
-# for any of the questions above to render on one line.
-SAMPLE_COLUMNS = 2
+# Colours for the severity chart, matching the theme in .streamlit/config.toml:
+# the indigo accent for measured values, a rose rule for the threshold.
+BAR_COLOUR = "#4F46E5"
+THRESHOLD_COLOUR = "#E11D48"
 
 st.set_page_config(
     page_title="AI Support Ticket Analyst",
+    page_icon=":material/support_agent:",
     layout="wide",
 )
 
@@ -117,89 +140,139 @@ def call_api(
     return response.json(), None
 
 
-def render_sidebar() -> dict[str, Any] | None:
+def render_sidebar() -> tuple[dict[str, Any] | None, str | None]:
     """Show service status and configuration in the sidebar.
 
     Surfaces the two things that most often explain unexpected behaviour: the
-    time anchor, and whether the language model is configured at all.
+    time anchor, and whether the language model is configured at all. Laid out
+    as a status line of badges, then one card per fact, so the state of the
+    system can be read at a glance rather than parsed from sentences.
 
     Returns:
-        The health payload, or ``None`` when the API is unreachable.
+        A ``(health, error)`` pair. ``health`` is the payload, or ``None``
+        when it could not be fetched - in which case ``error`` says why.
     """
-    st.sidebar.title("Service status")
+    sidebar = st.sidebar
+    sidebar.subheader("System status")
 
     health, error = call_api("GET", "/health")
     # Explicit rather than `assert health is not None`. Asserts are stripped
     # under `python -O`, after which None would flow onward and fail later with
     # an unrelated AttributeError, far from the request that actually failed.
     if health is None:
-        st.sidebar.error("The API returned no health information.")
-        return None
+        # The specific reason - not reachable, timed out, an error status - is
+        # the one thing that tells the reader what to do. It is returned for
+        # the main area to show in full; the sidebar shows only the state, so
+        # the same message does not appear twice on one screen.
+        reason = error or "The API returned no health information."
+        sidebar.markdown(":red-badge[:material/error: Offline]")
+        return None, reason
 
-    st.sidebar.success(f"API online - v{health['version']}")
-    st.sidebar.metric("Tickets loaded", f"{health['dataset_rows']:,}")
-
-    if health["llm_configured"]:
-        st.sidebar.caption(f"Model: `{health['model']}`")
-    else:
-        st.sidebar.warning(
-            "No API key configured. Anomaly detection still works; "
-            "natural-language questions do not."
-        )
-
-    st.sidebar.divider()
-    st.sidebar.caption("**Reference date**")
-    st.sidebar.code(health["as_of"], language=None)
-    st.sidebar.caption(
-        "This dataset is a fixed snapshot ending March 2024. Questions about "
-        '"this week" resolve against the date above, not today - otherwise '
-        "they would match nothing."
+    # One line answers "is it working?": service, build, and whether questions
+    # can be asked. Degraded mode is amber, not red - nothing has failed, one
+    # capability simply has no key.
+    # Labels kept short enough that all three badges fit the sidebar on one
+    # line; "Model connected" wrapped onto a second.
+    model_badge = (
+        ":blue-badge[:material/smart_toy: LLM ready]"
+        if health["llm_configured"]
+        else ":orange-badge[:material/warning: No LLM key]"
+    )
+    sidebar.markdown(
+        f":green-badge[:material/check_circle: Online] "
+        f":gray-badge[v{health['version']}] {model_badge}"
     )
 
-    return health
+    # The file name sits inside the same card as the count it produced, so the
+    # two read as one fact: 500 tickets, from this file.
+    with sidebar.container(border=True):
+        st.metric("Tickets loaded", f"{health['dataset_rows']:,}")
+        # .get() so a sidebar pointed at an older API still renders.
+        if health.get("dataset_file"):
+            st.caption(f":material/description: {escape_markdown(health['dataset_file'])}")
+    as_of_date, as_of_time = format_reference_date(health["as_of"])
+    sidebar.metric(
+        "Data as of",
+        as_of_date,
+        border=True,
+        # The explanation and the exact time live in the tooltip rather than
+        # beneath the card, keeping the sidebar to what is read at a glance.
+        help=(
+            (f"Latest ticket: {as_of_date}, {as_of_time}. " if as_of_time else "")
+            + "The dataset is a fixed snapshot, so questions such as \"this "
+            "week\" resolve against this date rather than today - against "
+            "today's date they would match nothing."
+        ),
+    )
+
+    # Neither the model's name nor a missing-key note is repeated here. The
+    # badge above already states whether questions can be asked; the name is
+    # in /health and every /query response; and the question tab explains a
+    # missing key where the reader tries to use it.
+
+    sidebar.divider()
+    # Points an evaluator straight at the second interface the brief requires.
+    sidebar.link_button(
+        "API documentation",
+        f"{API_BASE_URL}/docs",
+        icon=":material/menu_book:",
+        width="stretch",
+    )
+
+    return health, None
 
 
-def render_answer(payload: dict[str, Any]) -> None:
+def render_answer(question: str, payload: dict[str, Any]) -> None:
     """Display an answer together with the evidence behind it.
 
-    The SQL and the rows are shown beside the prose deliberately: an answer a
-    reviewer can verify is worth more than one they must trust.
+    The answer leads, in a card, with a quiet line of how it was produced;
+    the SQL and the rows follow, so an answer a reviewer can verify sits
+    directly above the evidence that verifies it.
 
     Args:
+        question: The question as the user asked it.
         payload: A ``/query`` response body.
     """
-    st.markdown(f"### {payload['answer']}")
+    with st.container(border=True):
+        st.caption(f":material/chat_bubble: {escape_markdown(question)}")
+        # Escaped because the answer is written by a model: "$" pairs would
+        # render as a formula and "*" or "_" as emphasis, altering what the
+        # data says. Identifiers are then held together so none splits
+        # across a line.
+        st.markdown(f"### {keep_identifiers_together(escape_markdown(payload['answer']))}")
+        st.markdown(answer_metadata(payload))
 
-    columns = st.columns(4)
-    columns[0].metric("Rows returned", payload["row_count"])
-    columns[1].metric("Tool used", payload["tool"] or "none")
-    columns[2].metric("Time", f"{payload['elapsed_ms'] / 1000:.1f}s")
-    columns[3].metric(
-        "Tokens", payload["prompt_tokens"] + payload["completion_tokens"]
-    )
+        if payload["sql"]:
+            with st.expander("Generated SQL", icon=":material/code:"):
+                st.code(payload["sql"], language="sql", wrap_lines=True)
 
-    if payload["sql"]:
-        with st.expander("Generated SQL", expanded=False):
-            st.code(payload["sql"], language="sql")
-
-    if payload["rows"]:
-        label = f"Results ({payload['row_count']} rows)"
-        if payload["truncated"]:
-            label += " - the model summarised a sample; all rows are shown here"
-        with st.expander(label, expanded=True):
-            st.dataframe(
-                pd.DataFrame(payload["rows"]),
-                width="stretch",
-                hide_index=True,
-            )
-
-    if payload.get("anomaly_reports"):
-        for report in payload["anomaly_reports"]:
-            render_report(report)
+        # An anomaly answer carries its reports, which already show every
+        # flagged ticket; listing the same tickets again as raw rows would
+        # only repeat them.
+        if payload.get("anomaly_reports"):
+            for report in payload["anomaly_reports"]:
+                render_report(report)
+        elif payload["rows"]:
+            rows = payload["row_count"]
+            with st.expander(
+                f"Results · {rows:,} row{'s' if rows != 1 else ''}",
+                icon=":material/table_rows:",
+                expanded=True,
+            ):
+                if payload["truncated"]:
+                    st.caption(
+                        "The answer describes a sample of these rows; every "
+                        "row is listed here."
+                    )
+                st.dataframe(
+                    blank_missing(pd.DataFrame(payload["rows"])),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 
 def render_report(report: dict[str, Any]) -> None:
-    """Display one detector's report.
+    """Display one detector's report as a self-contained card.
 
     The method and threshold are shown even when nothing was flagged: "no
     anomalies" only means something if the reader can see what was checked.
@@ -207,39 +280,45 @@ def render_report(report: dict[str, Any]) -> None:
     Args:
         report: A serialised anomaly report.
     """
-    st.subheader(report["description"])
+    with st.container(border=True):
+        st.markdown(f"#### {detector_label(report['kind'])}")
+        st.caption(f"{report['description']} · {report['method']}")
 
-    columns = st.columns(3)
-    columns[0].metric("Flagged", report["count"])
-    columns[1].metric("Considered", report["considered"])
-    columns[2].metric(
-        "Threshold",
-        "n/a" if report["threshold"] is None else f"{report['threshold']:g}",
-    )
-    st.caption(f"Method: {report['method']}")
+        flagged, considered, threshold = st.columns(3)
+        flagged.metric("Flagged", f"{report['count']:,}", border=True)
+        considered.metric("Considered", f"{report['considered']:,}", border=True)
+        threshold.metric(
+            "Threshold",
+            "n/a" if report["threshold"] is None else f"{report['threshold']:g} h",
+            border=True,
+        )
 
-    if not report["anomalies"]:
-        st.info("No anomalies found by this detector.")
-        return
+        if not report["anomalies"]:
+            st.info("Nothing crossed the threshold.", icon=":material/check_circle:")
+            return
 
-    frame = pd.DataFrame(report["anomalies"])
-    st.dataframe(
-        frame[
-            [
-                "ticket_id",
-                "priority",
-                "category",
-                "agent_id",
-                "value",
-                "threshold",
-                "reason",
-            ]
-        ],
-        width="stretch",
-        hide_index=True,
-    )
-
-    render_severity_chart(frame, threshold=report["threshold"])
+        frame = pd.DataFrame(report["anomalies"])
+        render_severity_chart(frame, threshold=report["threshold"])
+        with st.expander(
+            f"Flagged tickets · {report['count']:,}", icon=":material/list:"
+        ):
+            st.dataframe(
+                blank_missing(
+                    frame[
+                        [
+                            "ticket_id",
+                            "priority",
+                            "category",
+                            "agent_id",
+                            "value",
+                            "threshold",
+                            "reason",
+                        ]
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
 
 def render_severity_chart(frame: pd.DataFrame, *, threshold: float | None) -> None:
@@ -262,10 +341,10 @@ def render_severity_chart(frame: pd.DataFrame, *, threshold: float | None) -> No
 
     bars = (
         alt.Chart(top)
-        .mark_bar()
+        .mark_bar(color=BAR_COLOUR, cornerRadiusEnd=3)
         .encode(
             # sort="-x" orders the axis by the measured value rather than by
-            # ticket id, matching the table above it.
+            # ticket id, matching the table below it.
             y=alt.Y("ticket_id:N", sort="-x", title=None),
             x=alt.X("value:Q", title="Hours"),
             tooltip=["ticket_id", "priority", "category", "value", "reason"],
@@ -276,7 +355,7 @@ def render_severity_chart(frame: pd.DataFrame, *, threshold: float | None) -> No
     if threshold is not None:
         layers.append(
             alt.Chart(pd.DataFrame({"threshold": [threshold]}))
-            .mark_rule(color="#d62728", strokeDash=[5, 5], size=2)
+            .mark_rule(color=THRESHOLD_COLOUR, strokeDash=[5, 4], size=2)
             .encode(x="threshold:Q")
         )
 
@@ -284,11 +363,28 @@ def render_severity_chart(frame: pd.DataFrame, *, threshold: float | None) -> No
         # "container" lets Altair fill the column, avoiding Streamlit's
         # deprecated use_container_width parameter entirely.
         width="container",
-        height=min(28 * len(top) + 40, 560),
+        height=min(26 * len(top) + 40, 560),
     )
     st.altair_chart(chart)
+
+    notes = []
+    if len(frame) > len(top):
+        notes.append(f"The {len(top)} most severe of {len(frame)}, worst first.")
     if threshold is not None:
-        st.caption(f"The dashed line marks the {threshold:g} threshold.")
+        notes.append(f"The dashed line marks the {threshold:g} h threshold.")
+    if notes:
+        st.caption(" ".join(notes))
+
+
+def _queue_suggestion() -> None:
+    """Ask the suggested question the user just picked.
+
+    Runs as the chips' change callback, before the page re-renders: it queues
+    the question and clears the selection, so the chips behave as buttons - one
+    click asks - rather than as a setting that stays switched on.
+    """
+    st.session_state.pending_question = st.session_state.suggestion
+    st.session_state.suggestion = None
 
 
 def render_ask_tab(health: dict[str, Any]) -> None:
@@ -301,18 +397,20 @@ def render_ask_tab(health: dict[str, Any]) -> None:
         st.warning(
             "Natural-language questions need a Groq API key. Add `GROQ_API_KEY` "
             "to your `.env` file and restart. The Anomalies tab works without "
-            "one."
+            "one.",
+            icon=":material/key_off:",
         )
         return
 
-    st.caption("Try one of the sample questions, or ask your own.")
-
-    # Sample questions are buttons rather than a dropdown so a reviewer can
-    # exercise the system in one click, without typing.
-    columns = st.columns(SAMPLE_COLUMNS)
-    for index, question in enumerate(SAMPLE_QUESTIONS):
-        if columns[index % SAMPLE_COLUMNS].button(question, width="stretch"):
-            st.session_state.pending_question = question
+    # Chips rather than a grid of large buttons: a reviewer can still try a
+    # question in one click, without the suggestions outweighing the answer.
+    st.pills(
+        "Suggested questions",
+        SAMPLE_QUESTIONS,
+        selection_mode="single",
+        key="suggestion",
+        on_change=_queue_suggestion,
+    )
 
     asked = st.chat_input("Ask a question about the support tickets")
     if asked:
@@ -322,17 +420,14 @@ def render_ask_tab(health: dict[str, Any]) -> None:
     if not question:
         return
 
-    st.divider()
-    st.caption(f"**Question:** {question}")
-
     with st.spinner("Translating to SQL, querying, and composing an answer..."):
         payload, error = call_api("POST", "/query", json={"question": question})
 
     if payload is None:
-        st.error(error or "The API returned no answer.")
+        st.error(error or "The API returned no answer.", icon=":material/error:")
         return
 
-    render_answer(payload)
+    render_answer(question, payload)
 
 
 def render_anomalies_tab() -> None:
@@ -343,8 +438,8 @@ def render_anomalies_tab() -> None:
     dependency.
     """
     st.caption(
-        "Purely statistical - no language model involved. This tab works with "
-        "no API key configured."
+        ":material/functions: Purely statistical - no language model involved. "
+        "This tab works with no API key configured."
     )
 
     schema, error = call_api("GET", "/schema")
@@ -353,7 +448,8 @@ def render_anomalies_tab() -> None:
     left, right = st.columns(2)
     detector = left.selectbox(
         "Detector",
-        options=["All detectors", *detectors],
+        options=["all", *detectors],
+        format_func=lambda kind: "All detectors" if kind == "all" else detector_label(kind),
         help="Which check to run.",
     )
     window_label = right.selectbox(
@@ -367,42 +463,56 @@ def render_anomalies_tab() -> None:
     )
 
     params: dict[str, Any] = {}
-    if detector != "All detectors":
+    if detector != "all":
         params["kind"] = detector
     if window_label != "All history":
         params["window_days"] = int(window_label.split()[1])
 
     payload, error = call_api("GET", "/anomalies", params=params)
     if payload is None:
-        st.error(error or "The API returned no anomaly data.")
+        st.error(error or "The API returned no anomaly data.", icon=":material/error:")
         return
 
-    st.metric("Total anomalies", payload["total_anomalies"])
-    st.divider()
+    # A summary row first: the total, then each detector's count, so the
+    # shape of the result reads before any detail.
+    reports = payload["reports"]
+    summary = st.columns(len(reports) + 1)
+    summary[0].metric("Total anomalies", f"{payload['total_anomalies']:,}", border=True)
+    for column, report in zip(summary[1:], reports, strict=True):
+        column.metric(detector_label(report["kind"]), f"{report['count']:,}", border=True)
 
-    for report in payload["reports"]:
+    for report in reports:
         render_report(report)
-        st.divider()
 
 
 def main() -> None:
     """Compose the page."""
-    st.title("AI Support Ticket Analyst")
+    st.title("AI Support Ticket Analyst", anchor=False)
     st.caption(
-        "Ask questions in plain English. Every figure is computed by the "
-        "database and shown with the SQL that produced it - the model phrases "
-        "the answer, it never calculates it."
+        "Ask about support tickets in plain English. Every figure is computed "
+        "by the database and shown with the SQL that produced it - the model "
+        "phrases the answer, it never calculates it."
+    )
+    # The three properties that set this apart, stated where a first-time
+    # reader looks - not left to the README.
+    st.markdown(
+        ":blue-badge[:material/database: Read-only SQL] "
+        ":blue-badge[:material/verified: Every figure verified] "
+        ":blue-badge[:material/insights: Deterministic anomaly detection]"
     )
 
-    health = render_sidebar()
+    health, error = render_sidebar()
     if health is None:
-        st.error(
-            f"The API is not reachable at {API_BASE_URL}. "
-            "Start both services with `python run.py`."
-        )
+        # The actual reason, not an assumed one. "Not reachable" was shown for
+        # every failure, including an API that answered with an error or was
+        # merely slow - pointing the reader at the wrong fix. call_api already
+        # adds the "start it with python run.py" advice where that is the fix.
+        st.error(error, icon=":material/cloud_off:")
         return
 
-    ask_tab, anomalies_tab = st.tabs(["Ask a question", "Anomalies"])
+    ask_tab, anomalies_tab = st.tabs(
+        [":material/forum: Ask a question", ":material/monitoring: Anomalies"]
+    )
 
     with ask_tab:
         render_ask_tab(health)

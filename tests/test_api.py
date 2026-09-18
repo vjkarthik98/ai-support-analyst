@@ -23,6 +23,7 @@ access, credentials or cost.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from typing import Any
 
@@ -217,6 +218,22 @@ def test_health_reports_the_time_anchor(client: TestClient) -> None:
     assert client.get("/health").json()["as_of"] == "2024-03-30 18:06:00"
 
 
+def test_health_names_the_dataset_file(client: TestClient) -> None:
+    """The file the tickets came from is reported - its name, not its path.
+
+    Shown in the interface beside the ticket count, so a reader can see which
+    data every answer is computed from. The name alone is reported: a full
+    path would reveal the machine's folder layout to any API caller.
+
+    Args:
+        client: Test client with no language model configured.
+    """
+    name = client.get("/health").json()["dataset_file"]
+
+    assert name == "support_tickets.csv"
+    assert "/" not in name and "\\" not in name
+
+
 def test_health_reports_degraded_mode(client: TestClient) -> None:
     """Health distinguishes "no API key" from "broken".
 
@@ -368,6 +385,49 @@ def test_unknown_detector_returns_422_naming_the_options(client: TestClient) -> 
     assert not detail.startswith("'")
 
 
+class _BrokenDetector:
+    """A registered detector with a bug: it reads a column that is absent."""
+
+    kind = "broken"
+    description = "A detector with a defect"
+
+    def detect(self, frame: Any, *, as_of: Any, baseline: Any = None) -> Any:
+        """Fail the way a real bug would.
+
+        Args:
+            frame: Ignored.
+            as_of: Ignored.
+            baseline: Ignored.
+
+        Raises:
+            KeyError: Always - the detector reads a missing column.
+        """
+        raise KeyError("no_such_column")
+
+
+def test_a_fault_inside_a_detector_is_a_500_not_a_422(
+    unguarded_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug in a *registered* detector is reported as the server's fault.
+
+    ``/anomalies`` used to catch every KeyError as "unknown detector", so a
+    detector reading a missing column returned 422 - telling the caller their
+    valid request was wrong, and hiding the defect.
+
+    Args:
+        unguarded_client: Test client that surfaces server errors as responses.
+        monkeypatch: pytest's attribute patcher.
+    """
+    from app.anomalies import DETECTORS
+
+    monkeypatch.setitem(DETECTORS, "broken", _BrokenDetector())
+
+    response = unguarded_client.get("/anomalies", params={"kind": "broken"})
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "internal_error"
+
+
 def test_non_positive_window_is_rejected(client: TestClient) -> None:
     """A window of zero days is refused rather than returning nothing.
 
@@ -419,6 +479,79 @@ def test_query_returns_answer_and_evidence(llm_client: TestClient) -> None:
     assert payload["rows"] == [{"n": 111}]
     assert "SELECT COUNT(*)" in payload["sql"]
     assert payload["tool"] == QUERY_TOOL
+
+
+class BlockingClient:
+    """A chat client that holds its first call open until released.
+
+    Simulates a slow provider call - the real one blocks for seconds, and up
+    to its timeout - so a test can observe what the rest of the service does
+    in the meantime.
+
+    Attributes:
+        model: Identifier reported in responses.
+    """
+
+    model = "fake-model"
+
+    def __init__(self) -> None:
+        """Initialise the client with its gate closed."""
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def complete(self, *args: Any, **kwargs: Any) -> ChatResponse:
+        """Block until released, then decline.
+
+        Args:
+            *args: Ignored.
+            **kwargs: Ignored.
+
+        Returns:
+            A decline, which ends the question without further calls.
+        """
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return ChatResponse(text="declined", declined=True)
+
+
+def test_slow_question_does_not_block_other_requests(llm_client: TestClient) -> None:
+    """A question in flight leaves every other endpoint responsive.
+
+    The query pipeline makes blocking network calls. Declared ``async def``,
+    the endpoint ran them on the event loop itself, so one slow question froze
+    the whole API - ``/health`` included - until the model answered. Run in
+    the worker thread pool instead, it blocks only its own request.
+
+    Args:
+        llm_client: Test client with a running application.
+    """
+    database = llm_client.app.state.database
+    blocking = BlockingClient()
+    llm_client.app.state.query_service = TicketQueryService(
+        client=blocking,
+        db_path=database.path,
+        as_of=database.as_of,
+        row_count=database.row_count,
+    )
+
+    question = threading.Thread(
+        target=llm_client.post, args=("/query",), kwargs={"json": {"question": "q?"}}
+    )
+    question.start()
+    try:
+        assert blocking.entered.wait(timeout=5), "the question never reached the model"
+
+        health: dict[str, int] = {}
+        probe = threading.Thread(
+            target=lambda: health.update(status=llm_client.get("/health").status_code)
+        )
+        probe.start()
+        probe.join(timeout=3)
+
+        assert health.get("status") == 200, "/health was blocked by a question in flight"
+    finally:
+        blocking.release.set()
+        question.join(timeout=10)
 
 
 def test_query_reports_token_usage_and_timing(llm_client: TestClient) -> None:
@@ -757,3 +890,32 @@ def test_root_points_at_the_documentation(client: TestClient) -> None:
         client: Test client with no language model configured.
     """
     assert client.get("/").json()["docs"] == "/docs"
+
+
+def test_debug_level_does_not_switch_on_library_debug_output() -> None:
+    """LOG_LEVEL=DEBUG applies to this application, not to every library.
+
+    Set on the root logger, DEBUG also enabled the HTTP client's and the Groq
+    SDK's own debug output, burying the lines DEBUG exists to show. The app's
+    loggers get DEBUG; the root - and so every library - stays at INFO.
+
+    Global logging state is saved and restored, so no other test is affected.
+    """
+    import logging
+
+    from app.main import configure_logging
+
+    root, app_logger = logging.getLogger(), logging.getLogger("app")
+    saved = (root.handlers[:], root.level, app_logger.level)
+    root.handlers.clear()  # basicConfig only acts on an unconfigured root
+    try:
+        configure_logging("DEBUG")
+
+        assert app_logger.getEffectiveLevel() == logging.DEBUG
+        assert logging.getLogger("app.llm").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("groq").isEnabledFor(logging.DEBUG)
+    finally:
+        root.handlers[:] = saved[0]
+        root.setLevel(saved[1])
+        app_logger.setLevel(saved[2])

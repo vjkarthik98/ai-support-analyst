@@ -340,11 +340,15 @@ class ResolutionTimeOutlierDetector:
             _row_to_anomaly(
                 row,
                 kind=self.kind,
+                # The fence and its parts are stated to two decimals - the
+                # precision of the reported threshold. At one decimal, 48.15
+                # printed as "48.1" (it is stored as 48.1499...), so each row
+                # contradicted its own threshold column.
                 reason=(
                     f"Resolved in {row['resolution_time_hrs']:.1f}h, above the "
-                    f"{fence:.1f}h outlier threshold "
-                    f"(Q3 {third_quartile:.1f}h + {self.multiplier} x IQR "
-                    f"{third_quartile - first_quartile:.1f}h)"
+                    f"{fence:.2f}h outlier threshold "
+                    f"(Q3 {third_quartile:.2f}h + {self.multiplier} x IQR "
+                    f"{third_quartile - first_quartile:.2f}h)"
                 ),
                 value=row["resolution_time_hrs"],
                 threshold=fence,
@@ -479,6 +483,28 @@ class SlaBreachDetector:
         )
 
 
+class UnknownDetectorError(KeyError):
+    """Raised when a caller names a detector that is not registered.
+
+    A dedicated type so callers can catch *this* failure precisely. Catching
+    ``KeyError`` instead also caught every KeyError raised inside a detector -
+    a missing column, a bug - and reported it to the caller as "unknown
+    detector", disguising a server fault as a client mistake. It subclasses
+    ``KeyError`` because an unknown name is still a failed lookup.
+    """
+
+    def __str__(self) -> str:
+        """Return the message itself.
+
+        ``KeyError`` renders its argument with repr quotes, which would reach
+        the caller as a message wrapped in stray apostrophes.
+
+        Returns:
+            The explanation, unquoted.
+        """
+        return str(self.args[0]) if self.args else "Unknown anomaly detector."
+
+
 # The registry. Keyed by ``kind`` so callers - including the language model's
 # tool arguments - select a detector by a stable string rather than by import.
 DETECTORS: dict[str, AnomalyDetector] = {}
@@ -551,7 +577,11 @@ def apply_window(
         raise ValueError(f"window_days must be positive, got {window_days}")
 
     cutoff = as_of - timedelta(days=window_days)
-    return frame[frame["created_at"] >= cutoff]
+    # Bounded above as well as below. "The last 7 days" ends at as_of; a
+    # ticket raised after it is not in the window. Ingestion already drops such
+    # tickets when AS_OF is pinned, so this is a second, local guarantee
+    # rather than the only one.
+    return frame[(frame["created_at"] >= cutoff) & (frame["created_at"] <= as_of)]
 
 
 def detect_anomalies(
@@ -575,16 +605,17 @@ def detect_anomalies(
         One report per detector, in the order requested.
 
     Raises:
-        KeyError: If a requested detector is not registered. The message lists
-            the valid identifiers, because this argument may originate from a
-            language model's tool call and the error is fed back to it.
+        UnknownDetectorError: If a requested detector is not registered. The
+            message lists the valid identifiers, because this argument may
+            originate from a language model's tool call and the error is fed
+            back to it.
         ValueError: If ``window_days`` is not positive.
     """
     selected = kinds if kinds is not None else list(DETECTORS)
 
     unknown = [kind for kind in selected if kind not in DETECTORS]
     if unknown:
-        raise KeyError(
+        raise UnknownDetectorError(
             f"Unknown anomaly detector(s): {', '.join(unknown)}. "
             f"Available: {', '.join(sorted(DETECTORS))}"
         )
@@ -594,7 +625,22 @@ def detect_anomalies(
     # The unwindowed frame is passed as the baseline so statistical detectors
     # derive their thresholds from all available history, while judging only
     # the tickets inside the requested window.
-    return [
+    reports = [
         DETECTORS[kind].detect(windowed, as_of=as_of, baseline=frame)
         for kind in selected
     ]
+
+    for report in reports:
+        # Each detector's decision: what it applied, to how many tickets, and
+        # what it found - enough to see why a ticket was or was not flagged.
+        logger.debug(
+            "%s: flagged %d of %d considered (threshold %s; %s; window %s)",
+            report.kind,
+            report.count,
+            report.considered,
+            report.threshold,
+            report.method,
+            f"{window_days} days" if window_days else "all history",
+        )
+
+    return reports

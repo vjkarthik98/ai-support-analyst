@@ -130,6 +130,20 @@ def test_explicit_as_of_is_parsed(env_file: Callable[[str], Path]) -> None:
     assert settings.as_of == datetime(2024, 3, 30, 18, 6)
 
 
+def test_timezone_aware_as_of_is_rejected(env_file: Callable[[str], Path]) -> None:
+    """An AS_OF with a timezone fails at startup, naming AS_OF.
+
+    The ticket timestamps carry no timezone, and Python cannot compare the two
+    kinds. Accepted, it failed later inside the first anomaly check with an
+    error that never mentioned the setting at fault.
+
+    Args:
+        env_file: Factory writing a temporary ``.env``.
+    """
+    with pytest.raises(ValidationError, match="AS_OF must not include a timezone"):
+        Settings(_env_file=str(env_file("AS_OF=2024-03-30T18:06:00Z\n")))
+
+
 def test_relative_csv_path_resolves_against_the_repository_root(
     env_file: Callable[[str], Path],
 ) -> None:

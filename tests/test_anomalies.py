@@ -235,7 +235,9 @@ def test_reason_states_the_measurement_and_the_threshold(
     reason = report.anomalies[0].reason
 
     assert "200.0h" in reason
-    assert "70.0h" in reason
+    # Two decimals, the precision of the reported threshold - see
+    # test_reason_states_the_same_threshold_as_the_report.
+    assert "70.00h" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +527,26 @@ def test_window_keeps_only_recent_tickets(
     assert len(apply_window(frame, as_of=AS_OF, window_days=7)) == 1
 
 
+def test_window_excludes_tickets_after_the_reference_time(
+    make_frame: Callable[..., pd.DataFrame],
+) -> None:
+    """A window ends at the reference time, not at the end of the data.
+
+    Only reachable when AS_OF is pinned before the last ticket. "The last 7
+    days" previously had a lower bound and no upper one, so tickets raised
+    after the reference time were counted as recent.
+
+    Args:
+        make_frame: The general row factory.
+    """
+    frame = make_frame(
+        {"created_at": AS_OF - timedelta(days=2)},
+        {"created_at": AS_OF + timedelta(days=2)},
+    )
+
+    assert len(apply_window(frame, as_of=AS_OF, window_days=7)) == 1
+
+
 def test_no_window_returns_every_ticket(
     make_frame: Callable[..., pd.DataFrame],
 ) -> None:
@@ -674,6 +696,30 @@ def test_shipped_dataset_outlier_gate(real_database: Database) -> None:
     assert report.count == 21
 
 
+def test_reason_states_the_same_threshold_as_the_report(real_database: Database) -> None:
+    """Each flagged ticket's reason quotes the threshold its row reports.
+
+    At one decimal place 48.15 printed as "48.1" - it is stored as 48.1499... -
+    so every row read "above the 48.1h threshold" beside a threshold column of
+    48.15, and Q3 read 22.9 where the true value is 22.95.
+
+    Args:
+        real_database: Database built from the shipped CSV.
+    """
+    report = detect_anomalies(
+        load_frame(real_database.path),
+        as_of=real_database.as_of,
+        kinds=["resolution_time_outlier"],
+    )[0]
+
+    worst = report.anomalies[0]
+    assert worst.threshold == 48.15
+    assert worst.reason == (
+        "Resolved in 119.7h, above the 48.15h outlier threshold "
+        "(Q3 22.95h + 1.5 x IQR 16.80h)"
+    )
+
+
 def test_shipped_dataset_sla_gate(real_database: Database) -> None:
     """The real data yields 80 SLA breaches.
 
@@ -742,3 +788,23 @@ def test_every_anomaly_carries_a_reason(real_database: Database) -> None:
         for anomaly in report.anomalies:
             assert anomaly.reason.strip()
             assert anomaly.ticket_id.startswith("TKT-")
+
+
+def test_debug_log_shows_each_detector_decision(
+    real_database: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At DEBUG, every detector logs what it applied and what it found.
+
+    Args:
+        real_database: Database built from the shipped dataset.
+        caplog: pytest's log capture.
+    """
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="app")
+
+    detect_anomalies(load_frame(real_database.path), as_of=AS_OF)
+
+    assert "resolution_time_outlier: flagged 21 of 327 considered (threshold 48.15" in caplog.text
+    assert "sla_breach: flagged 80 of" in caplog.text
+    assert "window all history" in caplog.text

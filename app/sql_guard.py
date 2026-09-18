@@ -60,11 +60,11 @@ _ALLOWED_LEADING_KEYWORDS: Final[frozenset[str]] = frozenset({"SELECT", "WITH"})
 # identifier such as ``delete_candidates`` is unaffected (``_`` is a word
 # character, so the boundary never falls inside it).
 _FORBIDDEN_KEYWORDS: Final[tuple[str, ...]] = (
-    # Data modification
+    # Data modification. REPLACE is handled separately below: the same word
+    # is also a read-only string function.
     "INSERT",
     "UPDATE",
     "DELETE",
-    "REPLACE",
     "UPSERT",
     "MERGE",
     # Schema modification
@@ -97,6 +97,15 @@ _FORBIDDEN_PATTERN: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
+# REPLACE as a statement (REPLACE INTO, or WITH ... REPLACE INTO) writes data;
+# REPLACE(x, y, z) is SQLite's string-substitution function and only reads.
+# Listing the word as a forbidden keyword rejected the function too, refusing
+# a legitimate query such as REPLACE(issue_summary, ' ', '') for no reason.
+# The two are told apart by what follows: a function call opens a bracket.
+_REPLACE_STATEMENT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bREPLACE\b(?!\s*\()", re.IGNORECASE
+)
+
 _LEADING_WORD_PATTERN: Final[re.Pattern[str]] = re.compile(r"\s*([A-Za-z_]+)")
 
 _LIMIT_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bLIMIT\b", re.IGNORECASE)
@@ -121,6 +130,27 @@ _WALL_CLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
     # strftime('%Y', 'now') puts it second.
     r"\b(?:date|time|datetime|julianday|strftime|unixepoch)\s*\([^)]*'now'"
     r"|\bCURRENT_DATE\b|\bCURRENT_TIME\b|\bCURRENT_TIMESTAMP\b",
+    re.IGNORECASE,
+)
+
+
+# A month offset applied *before* 'start of month' in the same date call.
+# SQLite applies modifiers in order, and offsetting from a late day overflows
+# a short month: datetime('2024-03-30', '-1 month') is "30 February", which
+# SQLite normalises to 1 March - so 'start of month' then yields 1 March, and
+# "last month" silently becomes this month. Found by the benchmark: asked to
+# compare March with February, the query returned March alone.
+#
+# Like the wall-clock check, this catches a query that runs cleanly and returns
+# a wrong answer - the failure that does not look like one. The correct order,
+# 'start of month' first, is right for every anchor date, so rejecting the
+# unsafe order never blocks a legitimate query.
+#
+# Matched against the original statement, since the sanitised copy has had its
+# string literals - the modifiers themselves - emptied. [^()]* keeps the match
+# inside a single function call's argument list.
+_MONTH_OVERFLOW_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\([^()]*'\s*[+-]?\s*\d+\s+months?\s*'[^()]*'\s*start of month\s*'",
     re.IGNORECASE,
 )
 
@@ -295,10 +325,12 @@ def validate_select(sql: str, *, max_rows: int | None = None) -> str:
             f"with SELECT or WITH, but it begins with {leading_keyword}."
         )
 
-    forbidden_match = _FORBIDDEN_PATTERN.search(statement)
+    forbidden_match = _FORBIDDEN_PATTERN.search(
+        statement
+    ) or _REPLACE_STATEMENT_PATTERN.search(statement)
     if forbidden_match:
         raise SqlGuardError(
-            f"The statement uses {forbidden_match.group(1).upper()}, which is not "
+            f"The statement uses {forbidden_match.group(0).upper()}, which is not "
             "permitted. Only read-only SELECT queries can be executed."
         )
 
@@ -314,6 +346,17 @@ def validate_select(sql: str, *, max_rows: int | None = None) -> str:
             "today's date. This dataset is a fixed historical snapshot, so a "
             "query anchored to the present matches nothing. Use the reference "
             "timestamp given in the instructions instead."
+        )
+
+    if _MONTH_OVERFLOW_PATTERN.search(sql):
+        # Phrased so the repair retry can act on it directly: it names the
+        # problem and gives the corrected modifier order.
+        raise SqlGuardError(
+            "The statement applies a month offset before 'start of month'. "
+            "SQLite overflows short months - 30 March minus one month is "
+            "'30 February', which becomes 1 March - so this resolves 'last "
+            "month' to the current month. Put 'start of month' first, as in "
+            "datetime(anchor, 'start of month', '-1 month')."
         )
 
     # Return the ORIGINAL text, not the sanitised copy - the latter has had its
