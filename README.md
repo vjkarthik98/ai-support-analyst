@@ -2,31 +2,34 @@
 
 **Ask questions about customer support tickets in plain English. Every answer is computed by SQL and statistics; the language model never does the arithmetic.**
 
+![Release](https://img.shields.io/badge/release-v1.0.0-4F46E5)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688?logo=fastapi&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.64-FF4B4B?logo=streamlit&logoColor=white)
 ![Groq](https://img.shields.io/badge/LLM-Groq%20free%20tier-F55036)
 ![Tests](https://img.shields.io/badge/tests-381%20passing-brightgreen)
 
+**Current release: v1.0.0** (stable) - 18 September 2026. The HTTP API, the configuration settings and the `python run.py` startup are held stable under [Semantic Versioning](https://semver.org/); see [CHANGELOG.md](CHANGELOG.md) for what this release covers and how it got here.
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Screenshots](#screenshots)
-3. [The Core Principle](#the-core-principle)
-4. [Architecture](#architecture)
-5. [Design Decisions](#design-decisions)
-6. [Models and Tools](#models-and-tools)
-7. [Getting Started](#getting-started)
-8. [Configuration](#configuration)
-9. [Using the System](#using-the-system)
-10. [Example Queries and Outputs](#example-queries-and-outputs)
-11. [Testing and Evaluation](#testing-and-evaluation)
-12. [Known Limitations](#known-limitations)
-13. [Future Improvements](#future-improvements)
-14. [Project Structure](#project-structure)
+2. [Documentation](#documentation)
+3. [Screenshots](#screenshots)
+4. [The Core Principle](#the-core-principle)
+5. [Architecture](#architecture)
+6. [Design Decisions](#design-decisions)
+7. [Models and Tools](#models-and-tools)
+8. [Getting Started](#getting-started)
+9. [Configuration](#configuration)
+10. [Using the System](#using-the-system)
+11. [Example Queries and Outputs](#example-queries-and-outputs)
+12. [Testing and Evaluation](#testing-and-evaluation)
+13. [Known Limitations](#known-limitations)
+14. [Future Improvements](#future-improvements)
+15. [Project Structure](#project-structure)
 
 ---
 
@@ -42,6 +45,13 @@ The system ingests a 500-row support ticket dataset, answers natural-language qu
 | REST API **and** a minimal UI | FastAPI (4 endpoints plus interactive `/docs`) and a Streamlit UI that is a thin client of that API |
 | Use an LLM, zero cost | Groq free tier, `openai/gpt-oss-120b` |
 | Start with a single command | `python run.py` |
+
+---
+
+## Documentation
+
+- **[Project Documentation](docs/PROJECT_DOCUMENTATION.md)** — the full write-up of the system's design and reasoning.
+- **[System Card](docs/System_Card.pdf)** — capabilities, limitations and safety considerations of the deployed system.
 
 ---
 
@@ -616,6 +626,8 @@ ai-support-analyst/
 ├── data/
 │   └── support_tickets.csv
 ├── docs/
+│   ├── PROJECT_DOCUMENTATION.md
+│   ├── System_Card.pdf
 │   ├── BENCHMARK_QUESTIONS.md
 │   ├── BENCHMARK_RESULTS.md
 │   └── screenshots/       # UI and API screenshots used in this README

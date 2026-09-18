@@ -21,4 +21,4 @@ Surfaced at runtime by the /health endpoint, so the running build can always be
 identified.
 """
 
-__version__ = "0.8.0"
+__version__ = "1.0.0"

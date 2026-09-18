@@ -5,6 +5,68 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] - 2026-09-18
+
+The first stable release. Every requirement in the assessment brief is met,
+every defect found by the live benchmark and by a full code review is fixed,
+and the public contract below is now held stable under Semantic Versioning.
+
+1.0.0 contains no code changes beyond 0.8.0, which served as its release
+candidate: the fixes and features listed under 0.8.0 were completed, tested
+and verified live there, and are what this release makes stable. Declaring
+1.0.0 on an unchanged build, rather than on a final round of edits, means the
+version that is released is the version that was verified.
+
+### What 1.0.0 is
+
+- **Natural-language questions**, answered by SQL rather than by the model.
+  The model translates the question into a single read-only query and phrases
+  the result; SQLite computes every figure. A grounding check verifies that
+  every number in an answer - in digits or in words - appears in the evidence
+  the model was shown, and replaces any answer that fails with a plain,
+  deterministic summary.
+- **Anomaly detection with no model involved**: resolution-time outliers by
+  Tukey's fence (21 of 327 resolved tickets above 48.15 hours) and SLA breaches
+  (80 unresolved High or Critical tickets past 24 hours). Each flagged ticket
+  states its own reason.
+- **A REST API** of four endpoints - `/health`, `/schema`, `/anomalies` and
+  `/query` - with interactive documentation generated from the code, and a
+  distinct status code for every failure mode.
+- **A web interface** that is a thin client of that API, so the two cannot
+  disagree.
+- **One command to start everything**: `python run.py`.
+- **Evidence that it works**: 381 offline tests, and a 50-question live
+  benchmark with a 100% automatic pass rate (41 of 41 gradable questions; 9
+  refusals and explanations reviewed by hand).
+
+### Stable from this release
+
+A change that breaks any of the following will require version 2.0.0.
+
+- The HTTP API: the four endpoints, their parameters, every documented
+  request and response field, and the meaning of each status code - 422, 429,
+  502, 503 and 500.
+- Configuration: the names and meanings of the fourteen settings documented
+  in `.env.example`.
+- Startup: `python run.py` launches the API and the interface together.
+
+Deliberately not covered, and free to change in a minor release: the wording
+of model-written answers, log messages, the layout of the interface, and the
+text of error messages, whose status codes are covered.
+
+### Changed
+
+- Version set to 1.0.0, with no functional change from 0.8.0.
+
+### Known limitations
+
+Documented in full in the README rather than repeated here. In brief: the
+grounding check verifies numbers, not whether the SQL answered the intended
+question; model output can vary between runs; the free tier allows 8,000
+tokens per minute and 200,000 per day; the system is single-user and local,
+built for this dataset's schema.
+
+
 ## [0.8.0] - 2026-09-18
 
 A full code review, every benchmark failure traced to its root cause, and a
